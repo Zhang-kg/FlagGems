@@ -93,6 +93,10 @@ def _ppu_mm_configs():
         (128, 64, 64, 8, 3, 8, _LOAD_REGULAR),
         (64, 128, 64, 8, 3, 8, _LOAD_BOTH_AIU),
         (64, 128, 64, 8, 3, 8, _LOAD_REGULAR),
+        # BK=32 reduces the live dot-operand footprint enough for the AIU path
+        # to outperform both K=64 AIU and regular loads on large PPU GEMMs.
+        (64, 256, 32, 4, 4, 4, _LOAD_BOTH_AIU),
+        (64, 256, 32, 4, 4, 8, _LOAD_BOTH_AIU),
         (128, 128, 32, 4, 5, 8, _LOAD_REGULAR),
         (64, 256, 32, 4, 4, 2, _LOAD_REGULAR),
         (64, 256, 32, 4, 4, 8, _LOAD_REGULAR),
