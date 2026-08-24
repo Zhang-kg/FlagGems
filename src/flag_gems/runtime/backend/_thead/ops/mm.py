@@ -99,6 +99,7 @@ def _ppu_mm_configs():
         (64, 128, 64, 8, 3, 8, _LOAD_REGULAR),
         # BK=32 reduces the live dot-operand footprint enough for the AIU path
         # to outperform both K=64 AIU and regular loads on large PPU GEMMs.
+        (64, 256, 32, 4, 4, 1, _LOAD_BOTH_AIU),
         (64, 256, 32, 4, 4, 4, _LOAD_BOTH_AIU),
         (64, 256, 32, 4, 4, 8, _LOAD_BOTH_AIU),
         (128, 128, 32, 4, 5, 8, _LOAD_REGULAR),
@@ -176,6 +177,7 @@ if HAS_PPU_TLE:
         LOAD_MODE: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
         EVEN_K: tl.constexpr,
+        EVEN_MN: tl.constexpr,
     ):
         pid = tl.program_id(0)
         grid_m = tl.cdiv(M, BLOCK_M)
@@ -265,7 +267,10 @@ if HAS_PPU_TLE:
 
         c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
         c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=c_mask)
+        if EVEN_MN:
+            tl.store(c_ptrs, acc.to(C.dtype.element_ty))
+        else:
+            tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=c_mask)
 
 
     @triton.jit
@@ -287,6 +292,7 @@ if HAS_PPU_TLE:
         INTERLEAVED: tl.constexpr,
         LOAD_MODE: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
+        EVEN_MN: tl.constexpr,
     ):
         tile_id = tl.program_id(0)
         split_id = tl.program_id(1)
@@ -392,7 +398,10 @@ if HAS_PPU_TLE:
             + offs_n[None, :]
         )
         mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(workspace_ptrs, acc, mask=mask)
+        if EVEN_MN:
+            tl.store(workspace_ptrs, acc)
+        else:
+            tl.store(workspace_ptrs, acc, mask=mask)
 
 
     @triton.jit
@@ -403,21 +412,40 @@ if HAS_PPU_TLE:
         SPLIT_K: tl.constexpr,
         BLOCK: tl.constexpr,
         VEC: tl.constexpr,
+        EVEN_N: tl.constexpr,
     ):
         offsets = (
             tl.program_id(0) * BLOCK * VEC
             + tl.arange(0, BLOCK)[:, None] * VEC
             + tl.arange(0, VEC)[None, :]
         )
+        offsets = tl.max_contiguous(offsets, (1, VEC))
         mask = offsets < n_elements
         acc = tl.zeros((BLOCK, VEC), dtype=tl.float32)
-        for split_id in range(SPLIT_K):
-            acc += tl.load(
-                Workspace + split_id * n_elements + offsets,
-                mask=mask,
-                other=0.0,
-            )
-        tl.store(C + offsets, acc.to(C.dtype.element_ty), mask=mask)
+        workspace_ptrs = Workspace + offsets
+        # Mirror acBLAS's reduction schedule: process two adjacent slices per
+        # iteration and advance one base pointer.  This avoids rebuilding
+        # split_id * n_elements for every vector load in the generated ISA.
+        for _ in range(SPLIT_K // 2):
+            if EVEN_N:
+                x0 = tl.load(workspace_ptrs)
+                x1 = tl.load(workspace_ptrs + n_elements)
+            else:
+                x0 = tl.load(workspace_ptrs, mask=mask, other=0.0)
+                x1 = tl.load(
+                    workspace_ptrs + n_elements, mask=mask, other=0.0
+                )
+            acc += x0 + x1
+            workspace_ptrs += 2 * n_elements
+        if SPLIT_K % 2:
+            if EVEN_N:
+                acc += tl.load(workspace_ptrs)
+            else:
+                acc += tl.load(workspace_ptrs, mask=mask, other=0.0)
+        if EVEN_N:
+            tl.store(C + offsets, acc.to(C.dtype.element_ty))
+        else:
+            tl.store(C + offsets, acc.to(C.dtype.element_ty), mask=mask)
 
 
 def _can_use_ppu_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> bool:
@@ -469,6 +497,10 @@ def _run_ppu_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Te
             out.stride(0),
             out.stride(1),
             EVEN_K=K % 64 == 0,
+            # All production tiles are at most 512 in M/N.  This conservative
+            # predicate lets aligned large GEMMs omit the output mask without
+            # coupling launch code to the autotuner-selected tile.
+            EVEN_MN=M % 512 == 0 and N % 512 == 0,
         )
     return out
 
@@ -487,7 +519,10 @@ def _split_k_params(
     if M == 144 and N == 512 and K == 4096:
         return 2, 32, 128, 32, 5, 4, _LOAD_REGULAR, False
     if M == 384 and N == 512 and K == 4096:
-        return 4, 128, 128, 32, 4, 8, _LOAD_BOTH_AIU, True
+        # Match acBLAS's six-way K parallelism.  Keeping A on the regular load
+        # path and B on AIU avoids the small-A AIU setup cost while retaining
+        # asynchronous reuse of the much wider B tile.
+        return 6, 64, 256, 32, 4, 4, _LOAD_B_AIU, True
     return None
 
 
@@ -531,6 +566,7 @@ def _run_split_k_mm(
             INTERLEAVED=interleaved,
             LOAD_MODE=load_mode,
             PIPE_STAGES=stages,
+            EVEN_MN=M % block_m == 0 and N % block_n == 0,
             num_warps=warps,
             num_stages=stages,
         )
@@ -541,6 +577,7 @@ def _run_split_k_mm(
             SPLIT_K=split_k,
             BLOCK=128,
             VEC=8,
+            EVEN_N=(M * N) % (128 * 8) == 0,
             num_warps=4,
             num_stages=1,
         )
