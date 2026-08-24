@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import flag_gems
+from flag_gems.runtime import backend
 
 from . import accuracy_utils as utils
 
@@ -42,6 +43,14 @@ PPU_SHAPES = [
     (32, 384, 7168),
     (384, 512, 4096),
 ]
+
+
+def test_mm_thead_default_config_list_is_retained():
+    mm_globals = backend.get_backend_state().ops_module.mm.__globals__
+    configs = mm_globals["_ppu_mm_configs"]()
+
+    assert len(configs) == 44
+    assert all("PIPE_STAGES" in config.kwargs for config in configs)
 
 
 @pytest.mark.mm

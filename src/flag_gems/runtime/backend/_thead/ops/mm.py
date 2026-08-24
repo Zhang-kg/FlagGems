@@ -20,6 +20,7 @@ generic FlagGems implementation.
 """
 
 import logging
+import os
 
 import torch
 import triton
@@ -40,6 +41,9 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+EXPAND_CONFIG_FILENAME = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "mm_ppu_expand.yaml")
+)
 
 _LOAD_BOTH_AIU = 0
 _LOAD_A_AIU = 1
@@ -147,6 +151,9 @@ if HAS_PPU_TLE:
         strategy=["default", "default", "default"],
         warmup=5,
         rep=10,
+        flagtune_op_name="mm",
+        flagtune_expand_op_name="mm_ppu",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     )
     @triton.jit
     def mm_kernel_ppu(

@@ -1,0 +1,63 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Offline Expanded search space for the PPU row-major GEMM kernel.  The
+# production Pareto list remains in ops/mm.py and is used in Default mode.
+#
+# The Cartesian product contains 3,200 raw candidates.  The PPU-specific
+# config builder removes configurations that exceed the conservative shared
+# memory budget or require more than 128 FP32 accumulator registers per
+# thread, leaving 2,944 legal/performance-credible candidates.
+mm_ppu:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        GROUP_M: group_m
+        LOAD_MODE: load_mode
+      num_stages: stages
+      num_warps: warps
+    block_m:
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+    block_n:
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+    block_k:
+      - 32
+      - 64
+    group_m:
+      - 1
+      - 2
+      - 4
+      - 8
+    load_mode:
+      # Both operands use TLE/AIU asynchronous loads.
+      - 0
+      # Both operands use regular Triton loads.
+      - 3
+    stages:
+      - 2
+      - 3
+      - 4
+      - 5
+    warps:
+      - 4
+      - 8
+  - strategy:
+      M: default
+      N: default
+      K: default

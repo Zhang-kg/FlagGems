@@ -226,6 +226,56 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
+        if op_name == "mm_ppu":
+            # PPU num_stages controls both Triton's software-pipeline option
+            # and the explicit tl.range PIPE_STAGES constexpr.  Generate them
+            # from the same loop variable instead of taking an accidental
+            # Cartesian product of two nominally identical stage axes.
+            configs = []
+            element_bytes = 2  # PPU mm accepts FP16/BF16 only.
+            shared_memory_budget = 240 * 1024
+            max_accumulators_per_thread = 128
+            for block_m in ranges["BLOCK_M"]:
+                for block_n in ranges["BLOCK_N"]:
+                    for block_k in ranges["BLOCK_K"]:
+                        for group_m in ranges["GROUP_M"]:
+                            for load_mode in ranges["LOAD_MODE"]:
+                                for stages in ranges["s"]:
+                                    pipeline_buffers = max(stages - 1, 1)
+                                    shared_memory = (
+                                        (block_m + block_n)
+                                        * block_k
+                                        * element_bytes
+                                        * pipeline_buffers
+                                    )
+                                    if shared_memory > shared_memory_budget:
+                                        continue
+                                    for warps in ranges["w"]:
+                                        accumulators_per_thread = (
+                                            block_m * block_n // (warps * 32)
+                                        )
+                                        if (
+                                            accumulators_per_thread
+                                            > max_accumulators_per_thread
+                                        ):
+                                            continue
+                                        configs.append(
+                                            triton.Config(
+                                                {
+                                                    "BLOCK_M": block_m,
+                                                    "BLOCK_N": block_n,
+                                                    "BLOCK_K": block_k,
+                                                    "GROUP_M": group_m,
+                                                    "LOAD_MODE": load_mode,
+                                                    "PIPE_STAGES": stages,
+                                                },
+                                                num_stages=stages,
+                                                num_warps=warps,
+                                                pre_hook=pre_hook,
+                                            )
+                                        )
+            return configs
+
         if op_name in ("mm_nn", "mm_nt"):
             # "scenario" is optional so older expand yamls stay loadable, but
             # once present it must be set on every generated config: the tuner's
@@ -586,6 +636,12 @@ class TunedConfigLoader(object):
             "mm": self._build_single_expand_spec(
                 "mm", expand_yaml_path=self._get_expand_config_path("mm")
             ),
+            "mm_ppu": {
+                "yaml_op_name": "mm_ppu",
+                "key": ["M", "N", "K"],
+                "default_strategy": ["default", "default", "default"],
+                "expand_yaml_path": None,
+            },
             "mm_nn": self._build_single_expand_spec("mm_nn"),
             "mm_nt": self._build_single_expand_spec("mm_nt"),
             "mm_splitk_two_step": self._build_single_expand_spec(
