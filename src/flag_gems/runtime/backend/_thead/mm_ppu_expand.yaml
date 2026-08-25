@@ -61,3 +61,80 @@ mm_ppu:
       M: default
       N: default
       K: default
+
+# Expanded search for skinny GEMMs.  The kernel fixes its physical M dot tile
+# at 16, so only N/K/load/pipeline dimensions are tunable.
+mm_ppu_small_m:
+  - config:
+    param_map:
+      META:
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        LOAD_MODE: load_mode
+      num_stages: stages
+      num_warps: warps
+    block_n:
+      - 64
+      - 128
+      - 256
+      - 512
+    block_k:
+      - 32
+      - 64
+    load_mode:
+      - 0
+      - 1
+      - 2
+      - 3
+    stages:
+      - 2
+      - 3
+      - 4
+      - 5
+    warps:
+      - 4
+      - 8
+  - strategy:
+      M: default
+      N: default
+      K: default
+
+# Expanded search for 16 < M < 32.  BLOCK_M stays at the single legal 32-row
+# tile so AABS and ConfigCache keep an identical schema.
+mm_ppu_mid_m:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        LOAD_MODE: load_mode
+      num_stages: stages
+      num_warps: warps
+    block_m:
+      - 32
+    block_n:
+      - 64
+      - 128
+      - 256
+      - 512
+    block_k:
+      - 32
+      - 64
+    load_mode:
+      - 0
+      - 1
+      - 2
+      - 3
+    stages:
+      - 2
+      - 3
+      - 4
+      - 5
+    warps:
+      - 4
+      - 8
+  - strategy:
+      M: default
+      N: default
+      K: default

@@ -276,6 +276,48 @@ class TunedConfigLoader(object):
                                         )
             return configs
 
+        if op_name in ("mm_ppu_small_m", "mm_ppu_mid_m"):
+            configs = []
+            element_bytes = 2
+            shared_memory_budget = 240 * 1024
+            fixed_block_m = 16
+            include_block_m = op_name == "mm_ppu_mid_m"
+            if include_block_m:
+                fixed_block_m = 32
+            for block_n in ranges["BLOCK_N"]:
+                for block_k in ranges["BLOCK_K"]:
+                    for load_mode in ranges["LOAD_MODE"]:
+                        for stages in ranges["s"]:
+                            pipeline_buffers = max(stages - 1, 1)
+                            shared_memory = (
+                                (fixed_block_m + block_n)
+                                * block_k
+                                * element_bytes
+                                * pipeline_buffers
+                            )
+                            if shared_memory > shared_memory_budget:
+                                continue
+                            for warps in ranges["w"]:
+                                configs.append(
+                                    triton.Config(
+                                        {
+                                            **(
+                                                {"BLOCK_M": fixed_block_m}
+                                                if include_block_m
+                                                else {}
+                                            ),
+                                            "BLOCK_N": block_n,
+                                            "BLOCK_K": block_k,
+                                            "LOAD_MODE": load_mode,
+                                            "PIPE_STAGES": stages,
+                                        },
+                                        num_stages=stages,
+                                        num_warps=warps,
+                                        pre_hook=pre_hook,
+                                    )
+                                )
+            return configs
+
         if op_name in ("mm_nn", "mm_nt"):
             # "scenario" is optional so older expand yamls stay loadable, but
             # once present it must be set on every generated config: the tuner's
@@ -638,6 +680,18 @@ class TunedConfigLoader(object):
             ),
             "mm_ppu": {
                 "yaml_op_name": "mm_ppu",
+                "key": ["M", "N", "K"],
+                "default_strategy": ["default", "default", "default"],
+                "expand_yaml_path": None,
+            },
+            "mm_ppu_small_m": {
+                "yaml_op_name": "mm_ppu_small_m",
+                "key": ["M", "N", "K"],
+                "default_strategy": ["default", "default", "default"],
+                "expand_yaml_path": None,
+            },
+            "mm_ppu_mid_m": {
+                "yaml_op_name": "mm_ppu_mid_m",
                 "key": ["M", "N", "K"],
                 "default_strategy": ["default", "default", "default"],
                 "expand_yaml_path": None,

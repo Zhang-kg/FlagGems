@@ -16,11 +16,32 @@ from typing import Generator
 
 import pytest
 import torch
+import yaml
 
 from . import base, consts
 
 
 class MvBenchmark(base.GenericBenchmark2DOnly):
+    def set_shapes(self, shape_file_path=None):
+        with open(shape_file_path, "r", encoding="utf-8") as shape_file:
+            shape_config = yaml.safe_load(shape_file) or {}
+
+        if "mv" in shape_config or "mm" not in shape_config:
+            return super().set_shapes(shape_file_path)
+
+        # Model traces commonly record GEMV as mm(M, K) x (K, 1).  Accept that
+        # schema directly so benchmark/test_mv.py can consume trace YAMLs
+        # without maintaining a transformed copy.
+        mm_shapes = shape_config.get("mm", {}).get("shapes", [])
+        self.shapes = list(
+            dict.fromkeys(
+                (int(shape[1]), int(shape[3]))
+                for shape in mm_shapes
+                if len(shape) >= 4 and int(shape[2]) == 1
+            )
+        )
+        self.shape_desc = "M, K"
+
     def set_more_shapes(self):
         return []
 

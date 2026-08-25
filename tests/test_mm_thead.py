@@ -27,6 +27,10 @@ pytestmark = pytest.mark.skipif(
 
 
 PPU_SHAPES = [
+    (2, 128, 64),
+    (5, 256, 128),
+    (8, 64, 128),
+    (16, 64, 128),
     (32, 64, 32),
     (33, 65, 48),
     (63, 127, 64),
@@ -40,6 +44,7 @@ PPU_SHAPES = [
     (512, 1024, 512),
     (1024, 1024, 1024),
     (100, 4096, 1024),
+    (104, 64, 128),
     (32, 384, 7168),
     (384, 512, 4096),
 ]
@@ -49,8 +54,43 @@ def test_mm_thead_default_config_list_is_retained():
     mm_globals = backend.get_backend_state().ops_module.mm.__globals__
     configs = mm_globals["_ppu_mm_configs"]()
 
-    assert len(configs) == 44
+    assert len(configs) == 67
     assert all("PIPE_STAGES" in config.kwargs for config in configs)
+
+    small_m_configs = mm_globals["_ppu_small_m_configs"]()
+    assert len(small_m_configs) == 27
+    assert all("BLOCK_M" not in config.kwargs for config in small_m_configs)
+    assert all("PIPE_STAGES" in config.kwargs for config in small_m_configs)
+
+    mid_m_configs = mm_globals["_ppu_mid_m_configs"]()
+    assert len(mid_m_configs) == 27
+    assert {config.kwargs["BLOCK_M"] for config in mid_m_configs} == {32}
+    assert all("PIPE_STAGES" in config.kwargs for config in mid_m_configs)
+
+    gemv_configs = mm_globals["_ppu_gemv_configs"]()
+    assert len(gemv_configs) == 17
+    assert {config.kwargs["BLOCK_M"] for config in gemv_configs} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+    }
+    assert all("PIPE_STAGES" in config.kwargs for config in gemv_configs)
+
+
+@pytest.mark.mv
+@pytest.mark.parametrize("M,K", [(1, 2048), (136, 4096), (1035, 2048), (16384, 4096)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mv_thead_ppu_gemv(M, K, dtype):
+    matrix = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
+    vector = torch.randn((K,), dtype=dtype, device=flag_gems.device)
+    ref = torch.mv(utils.to_reference(matrix, True), utils.to_reference(vector, True))
+
+    with flag_gems.use_gems():
+        actual = torch.mv(matrix, vector)
+
+    utils.gems_assert_close(actual, ref, dtype, reduce_dim=K)
 
 
 @pytest.mark.mm
@@ -69,9 +109,11 @@ def test_mm_thead_ppu_contiguous_nn(M, N, K, dtype):
 
 
 @pytest.mark.mm_out
+@pytest.mark.parametrize(
+    "M,N,K", [(5, 256, 128), (24, 256, 128), (104, 64, 128)]
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_mm_out_thead_ppu_contiguous_nn(dtype):
-    M, N, K = 100, 256, 128
+def test_mm_out_thead_ppu_contiguous_nn(M, N, K, dtype):
     a = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
     b = torch.randn((K, N), dtype=dtype, device=flag_gems.device)
     out = torch.empty((M, N), dtype=dtype, device=flag_gems.device)
@@ -84,9 +126,36 @@ def test_mm_out_thead_ppu_contiguous_nn(dtype):
     utils.gems_assert_close(out, ref, dtype, reduce_dim=K)
 
 
+@pytest.mark.mm
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mm_thead_m1_keeps_gemv_fallback(dtype):
+    mm_globals = backend.get_backend_state().ops_module.mm.__globals__
+    a = torch.randn((1, 128), dtype=dtype, device=flag_gems.device)
+    b = torch.randn((128, 128), dtype=dtype, device=flag_gems.device)
+    out = torch.empty((1, 128), dtype=dtype, device=flag_gems.device)
+
+    assert not mm_globals["_can_use_ppu_mm"](a, b, out)
+
+
 @pytest.mark.mm_out
 @pytest.mark.parametrize(
-    "M,N,K", [(32, 384, 7168), (144, 512, 4096), (384, 512, 4096)]
+    "M,N,K",
+    [
+        (2, 512, 7168),
+        (24, 384, 7168),
+        (64, 512, 7168),
+        (128, 512, 7168),
+        (136, 512, 7168),
+        (256, 384, 7168),
+        (320, 512, 7168),
+        (384, 512, 7168),
+        (480, 512, 7168),
+        (512, 384, 7168),
+        (208, 2112, 7168),
+        (32, 384, 7168),
+        (144, 512, 4096),
+        (384, 512, 4096),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_mm_out_thead_ppu_split_k(M, N, K, dtype):
@@ -100,6 +169,36 @@ def test_mm_out_thead_ppu_split_k(M, N, K, dtype):
 
     assert returned.data_ptr() == out.data_ptr()
     utils.gems_assert_close(out, ref, dtype, reduce_dim=K)
+
+
+def test_mm_thead_k7168_split_k_policy():
+    mm_globals = backend.get_backend_state().ops_module.mm.__globals__
+    split_k_params = mm_globals["_split_k_params"]
+
+    assert split_k_params(2, 512, 7168)[:4] == (7, 16, 128, 64)
+    assert split_k_params(24, 384, 7168)[:4] == (7, 32, 128, 64)
+    assert split_k_params(32, 384, 7168)[:4] == (8, 16, 64, 32)
+    assert split_k_params(32, 512, 7168)[:4] == (8, 16, 64, 32)
+    assert split_k_params(128, 512, 7168)[:4] == (4, 64, 128, 64)
+    assert split_k_params(136, 512, 7168)[:4] == (2, 32, 128, 64)
+    assert split_k_params(240, 512, 7168)[:4] == (2, 64, 128, 64)
+    assert split_k_params(240, 384, 7168)[:4] == (2, 32, 128, 64)
+    assert split_k_params(320, 384, 7168)[:4] == (4, 128, 128, 32)
+    assert split_k_params(320, 512, 7168)[:4] == (2, 64, 128, 64)
+    assert split_k_params(384, 512, 7168) == (
+        6,
+        128,
+        128,
+        32,
+        5,
+        4,
+        mm_globals["_LOAD_BOTH_AIU"],
+        True,
+    )
+    assert split_k_params(480, 512, 7168)[:4] == (5, 128, 128, 32)
+    assert split_k_params(512, 384, 7168)[:4] == (6, 128, 128, 32)
+    assert split_k_params(208, 2112, 7168)[:4] == (2, 128, 128, 32)
+    assert split_k_params(400, 512, 7168) is None
 
 
 @pytest.mark.mm
