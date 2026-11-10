@@ -118,6 +118,7 @@ _SMALL_M_TLE_SHAPES = {
 }
 
 _SMALL_M_TLE_NT_ONLY_SHAPES = {
+    (64, 255, 2048),
     (144, 4096, 1024),
 }
 
@@ -302,9 +303,8 @@ def _launch_addmm_nt_gemv(
 
 
 def _nt_gemv_config(bias, mat1, mat2, out):
-    config = _NT_GEMV_CONFIGS.get(
-        (mat1.shape[0], mat2.shape[1], mat1.shape[1])
-    )
+    shape = (mat1.shape[0], mat2.shape[1], mat1.shape[1])
+    config = _NT_GEMV_CONFIGS.get(shape)
     if config is None:
         return None
     m, k = mat1.shape
@@ -315,8 +315,10 @@ def _nt_gemv_config(bias, mat1, mat2, out):
         and bias.dtype == mat1.dtype
         and mat1.stride(0) == k
         and mat1.stride(1) == 1
-        and mat2.stride(0) == 1
-        and mat2.stride(1) == k
+        and (
+            (mat2.stride(0) == 1 and mat2.stride(1) == k)
+            or (shape == (1, 4, 16384) and mat2.is_contiguous())
+        )
     ):
         return None
     if out is not None and not (
@@ -625,13 +627,14 @@ def _small_m_tle_eligible(bias, mat1, mat2, out):
     ):
         return False
     mat2_supported = mat2.is_contiguous() or trans_b
+    descriptor_strides_aligned = k % 2 == 0 and (trans_b or n % 2 == 0)
     out_supported = out is None or (
         out.dtype == mat1.dtype
         and out.device == mat1.device
         and out.shape == (m, n)
         and out.is_contiguous()
     )
-    return mat2_supported and out_supported
+    return mat2_supported and descriptor_strides_aligned and out_supported
 
 
 @libentry()
