@@ -43,7 +43,6 @@ DIRECT_NT_BM64_BN128_BK64_F16_K71_PATH = (
 # Fixed, stride-aware launches avoid both the libtuner lookup in the generic
 # fallback and the full B.contiguous() copy for a transpose-view B tensor.
 _CATALOG_CONFIGS = {
-    (32, 512, 4096): ("catalog_bm32_bn128_bk64_w8", 32, 128, 64, 8),
     (16384, 1, 4096): ("catalog_bm64_bn16_bk64_w4", 64, 16, 64, 4),
     (512, 256, 2048): ("catalog_bm64_bn128_bk64_w8", 64, 128, 64, 8),
     (128, 128, 64): ("catalog_bm64_bn64_bk64_w4", 64, 64, 64, 4),
@@ -358,7 +357,7 @@ def dispatch_path(a: torch.Tensor, b: torch.Tensor) -> Optional[str]:
         shape = (a.shape[1], b.shape[2], a.shape[2])
         trans_b = _is_upstream_transpose_view(b)
         use_tiled_path = (
-            shape in ((32, 512, 4096), (128, 128, 64))
+            shape == (128, 128, 64)
             or (shape == (16384, 1, 4096) and b.is_contiguous())
             or (shape == (512, 256, 2048) and (trans_b or a.shape[0] == 8))
             or (shape == (65, 257, 2049) and trans_b)
