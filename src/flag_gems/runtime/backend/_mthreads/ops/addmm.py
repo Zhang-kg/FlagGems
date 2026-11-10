@@ -198,9 +198,7 @@ def _addmm_nt_gemv_kernel(
         offsets_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offsets_k < K
         weight = tl.load(
-            mat2
-            + offsets_k[None, :] * stride_bk
-            + offsets_n[:, None] * stride_bn,
+            mat2 + offsets_k[None, :] * stride_bk + offsets_n[:, None] * stride_bn,
             mask=mask_n[:, None] & mask_k[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -270,8 +268,8 @@ def _launch_addmm_nt_gemv(
     n = mat2.shape[1]
     if out is None:
         out = torch.empty((m, n), dtype=mat1.dtype, device=mat1.device)
-    bias, stride_bias_m, stride_bias_n, bias_is_vector, bias_is_scalar = (
-        _prepare_bias(bias, out)
+    bias, stride_bias_m, stride_bias_n, bias_is_vector, bias_is_scalar = _prepare_bias(
+        bias, out
     )
     with torch_device_fn.device(mat1.device):
         _addmm_nt_gemv_kernel[(triton.cdiv(n, block_n),)](
@@ -441,17 +439,13 @@ def _small_m_bm64_bn64_bk128_s2_consumer(
         ).to(tl.float32)[None, :]
     else:
         bias_tile = tl.load(
-            bias
-            + rows[:, None] * stride_bias_m
-            + columns[None, :] * stride_bias_n,
+            bias + rows[:, None] * stride_bias_m + columns[None, :] * stride_bias_n,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
     output = accumulator * alpha + bias_tile * beta
     tl.store(
-        out
-        + rows[:, None] * stride_out_m
-        + columns[None, :] * stride_out_n,
+        out + rows[:, None] * stride_out_m + columns[None, :] * stride_out_n,
         output.to(out.dtype.element_ty),
         mask=mask,
     )
@@ -568,8 +562,8 @@ def _launch_addmm_bm64_bn64_bk128_s2_small_m_ws(
     n = mat2.shape[1]
     if out is None:
         out = torch.empty((m, n), dtype=mat1.dtype, device=mat1.device)
-    bias, stride_bias_m, stride_bias_n, bias_is_vector, bias_is_scalar = (
-        _prepare_bias(bias, out)
+    bias, stride_bias_m, stride_bias_n, bias_is_vector, bias_is_scalar = _prepare_bias(
+        bias, out
     )
     trans_b = mat2.stride(0) == 1 and mat2.stride(1) == k
     a_desc = TensorDescriptor.from_tensor(mat1, [64, 128])
