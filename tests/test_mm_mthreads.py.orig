@@ -1,0 +1,349 @@
+import importlib
+from pathlib import Path
+
+import pytest
+import torch
+
+from flag_gems.runtime.configs_loader import TunedConfigLoader
+
+
+mm_mod = importlib.import_module("flag_gems.runtime.backend._mthreads.ops.mm")
+
+
+class _FakeTensor:
+    def __init__(self, shape, dtype=torch.bfloat16):
+        self.shape = shape
+        self.dtype = dtype
+
+    def is_contiguous(self):
+        return True
+
+
+def test_mm_mthreads_old_flagtree_falls_back(monkeypatch):
+    sentinel = object()
+    a = _FakeTensor((4434, 2048))
+    b = _FakeTensor((2048, 1024))
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_PIPE_SQMMA", False)
+    monkeypatch.setattr(mm_mod, "_generic_mm", lambda lhs, rhs: sentinel)
+
+    assert mm_mod.mm(a, b) is sentinel
+
+
+def test_mm_mthreads_multifield_pipe_capability_guard(monkeypatch):
+    a = _FakeTensor((64, 4096))
+    b = _FakeTensor((4096, 2560))
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_PIPE_SQMMA", True)
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_MULTIFIELD_PIPE", False)
+    assert not mm_mod.is_tle_pipe_compatible(a, b, 64, 2560, 4096)
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_MULTIFIELD_PIPE", True)
+    assert mm_mod.is_tle_pipe_compatible(a, b, 64, 2560, 4096)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((4138, 1024, 2048), True),
+        ((4434, 1024, 2048), True),
+        ((4435, 1024, 2048), True),
+        ((2048, 2048, 512), True),
+        ((16384, 2048, 512), True),
+        ((4096, 1024, 2048), False),
+        ((4481, 1024, 2048), False),
+        ((2047, 2048, 512), False),
+        ((16385, 2048, 512), False),
+        ((4434, 256, 2048), False),
+        ((4434, 1024, 4096), False),
+    ],
+)
+def test_mm_mthreads_split_m_capability_guard(monkeypatch, shape, expected):
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_SPLIT_M_SQMMA", True)
+    assert mm_mod.is_tle_split_m_compatible(*shape) is expected
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_SPLIT_M_SQMMA", False)
+    assert not mm_mod.is_tle_split_m_compatible(*shape)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((100, 248320, 2048), True),
+        ((99, 248320, 2048), False),
+        ((100, 31040, 4096), False),
+    ],
+)
+def test_mm_mthreads_split128_capability_guard(monkeypatch, shape, expected):
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_SPLIT128_SQMMA", True)
+    assert mm_mod.is_tle_split128_compatible(*shape) is expected
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_SPLIT128_SQMMA", False)
+    assert not mm_mod.is_tle_split128_compatible(*shape)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((4, 9216, 2048), True),
+        ((64, 12288, 2048), True),
+        ((128, 9216, 2048), True),
+        ((256, 12288, 2048), True),
+        ((3, 9216, 2048), False),
+        ((257, 9216, 2048), False),
+        ((64, 8192, 2048), False),
+        ((64, 9216, 4096), False),
+    ],
+)
+def test_mm_mthreads_split_n_capability_guard(monkeypatch, shape, expected):
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_SPLIT128_SQMMA", True)
+    assert mm_mod.is_tle_split_n_compatible(*shape) is expected
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_SPLIT128_SQMMA", False)
+    assert not mm_mod.is_tle_split_n_compatible(*shape)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((257, 9216, 2048), True),
+        ((384, 12288, 2048), True),
+        ((496, 9216, 2048), True),
+        ((2048, 1024, 2048), True),
+        ((512, 2048, 512), True),
+        ((1036, 2048, 512), True),
+        ((256, 9216, 2048), False),
+        ((497, 12288, 2048), False),
+        ((2047, 1024, 2048), False),
+        ((2048, 1024, 4096), False),
+        ((511, 2048, 512), False),
+        ((1041, 2048, 512), False),
+        ((384, 8192, 2048), False),
+        ((384, 9216, 4096), False),
+    ],
+)
+def test_mm_mthreads_split256_ordered_capability_guard(
+    monkeypatch, shape, expected
+):
+    monkeypatch.setattr(
+        mm_mod, "HAS_MTHREADS_TLE_PERSISTENT_ORDERED_SQMMA", True
+    )
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_DYNAMIC_PARTITION_SYNC", True)
+    assert mm_mod.is_tle_split256_ordered_compatible(*shape) is expected
+
+    monkeypatch.setattr(
+        mm_mod, "HAS_MTHREADS_TLE_PERSISTENT_ORDERED_SQMMA", False
+    )
+    assert not mm_mod.is_tle_split256_ordered_compatible(*shape)
+
+    monkeypatch.setattr(
+        mm_mod, "HAS_MTHREADS_TLE_PERSISTENT_ORDERED_SQMMA", True
+    )
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_DYNAMIC_PARTITION_SYNC", False)
+    assert not mm_mod.is_tle_split256_ordered_compatible(*shape)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((257, 9216, 2048), True),
+        ((384, 9216, 2048), True),
+        ((480, 9216, 2048), True),
+        ((512, 9216, 2048), True),
+        ((256, 9216, 2048), False),
+        ((513, 9216, 2048), False),
+        ((496, 12288, 2048), False),
+        ((480, 12288, 2048), False),
+        ((480, 9216, 4096), False),
+    ],
+)
+def test_mm_mthreads_bn320_capability_guard(monkeypatch, shape, expected):
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_DYNAMIC_PARTITION_SYNC", True)
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_BN320_SQMMA", True)
+    assert mm_mod.is_tle_bn320_compatible(*shape) is expected
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_BN320_SQMMA", False)
+    assert not mm_mod.is_tle_bn320_compatible(*shape)
+
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_BN320_SQMMA", True)
+    monkeypatch.setattr(mm_mod, "HAS_MTHREADS_TLE_DYNAMIC_PARTITION_SYNC", False)
+    assert not mm_mod.is_tle_bn320_compatible(*shape)
+
+
+@pytest.mark.parametrize(
+    ("M", "expected"),
+    [(257, 64), (384, 64), (385, 128), (512, 128)],
+)
+def test_mm_mthreads_bn320_selects_bottom_consumer_height(M, expected):
+    assert mm_mod.get_tle_bn320_block_m_bottom(M) == expected
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((192, 4096, 1024), (64, 128, 128, 2, 4, 8, False)),
+        ((193, 4096, 1024), (128, 128, 64, 2, 4, 8, False)),
+        ((271, 4096, 128), (64, 64, 128, 1, 4, 1, False)),
+        ((272, 4096, 128), (64, 128, 128, 1, 4, 8, False)),
+        ((320, 4096, 128), (64, 128, 128, 1, 4, 8, False)),
+        ((321, 4096, 128), (128, 128, 128, 1, 4, 4, False)),
+        ((512, 4096, 128), (128, 128, 128, 1, 4, 4, False)),
+        ((192, 1024, 2048), (64, 64, 256, 3, 4, 1, False)),
+        ((193, 1024, 2048), (64, 64, 128, 3, 4, 1, False)),
+        ((320, 1024, 2048), (64, 64, 128, 3, 4, 1, False)),
+        ((321, 1024, 2048), (128, 64, 128, 2, 4, 1, False)),
+        ((511, 1024, 2048), (128, 64, 128, 2, 4, 1, False)),
+        ((512, 1024, 2048), (128, 128, 128, 2, 4, 4, False)),
+        ((513, 1024, 2048), (128, 128, 64, 3, 4, 4, False)),
+        ((1040, 1024, 2048), (128, 128, 64, 3, 4, 4, False)),
+        ((1041, 1024, 2048), (256, 256, 64, 3, 16, 1, True)),
+        ((1, 2048, 512), (64, 128, 128, 2, 4, 2, False)),
+        ((511, 2048, 512), (64, 128, 128, 2, 4, 2, False)),
+        ((512, 2048, 512), (256, 256, 64, 3, 16, 8, True)),
+        ((1, 512, 4096), (64, 64, 256, 3, 4, 2, False)),
+        ((511, 512, 4096), (64, 64, 256, 3, 4, 2, False)),
+        ((512, 512, 4096), (128, 64, 256, 2, 4, 1, False)),
+        ((513, 512, 4096), (128, 128, 128, 2, 4, 4, False)),
+        ((1040, 512, 4096), (128, 128, 128, 2, 4, 4, False)),
+        ((1041, 512, 4096), (256, 256, 64, 3, 16, 1, True)),
+        ((2048, 512, 4096), (128, 128, 64, 3, 4, 4, False)),
+        ((71, 2048, 4096), (64, 64, 256, 3, 4, 1, False)),
+        ((72, 2048, 4096), (64, 128, 128, 2, 4, 2, False)),
+        ((272, 2048, 4096), (64, 128, 128, 2, 4, 2, False)),
+        ((273, 2048, 4096), (64, 128, 64, 3, 4, 2, False)),
+        ((448, 2048, 4096), (64, 128, 64, 3, 4, 2, False)),
+        ((449, 2048, 4096), (128, 128, 64, 3, 4, 4, False)),
+        ((512, 2048, 4096), (128, 128, 64, 3, 4, 4, False)),
+        ((64, 2560, 4096), (64, 64, 256, 3, 4, 1, False)),
+        ((65, 2560, 4096), (64, 128, 128, 2, 4, 8, False)),
+        ((224, 2560, 4096), (64, 128, 128, 2, 4, 8, False)),
+        ((225, 2560, 4096), (64, 128, 64, 3, 4, 8, False)),
+        ((384, 2560, 4096), (64, 128, 64, 3, 4, 8, False)),
+        ((385, 2560, 4096), (128, 128, 64, 3, 4, 8, False)),
+        ((512, 2560, 4096), (128, 128, 64, 3, 4, 8, False)),
+        ((4138, 64, 2048), (64, 64, 128, 2, 4, 1, False)),
+        ((512, 256, 2048), (64, 64, 256, 3, 4, 1, False)),
+        ((1036, 256, 2048), (64, 64, 128, 2, 4, 1, False)),
+        ((4434, 256, 2048), (128, 128, 64, 3, 4, 1, False)),
+        ((16384, 9216, 2048), (256, 256, 64, 2, 16, 2, True)),
+        ((16384, 12288, 2048), (256, 256, 64, 2, 16, 2, True)),
+    ],
+)
+def test_mm_mthreads_tle_pipe_topology_dispatch(shape, expected):
+    assert mm_mod.use_tle_ws_pipe(*shape) is expected[-1]
+
+
+def test_mm_mthreads_tle_pipe_expanded_configs_cover_pipeline_axes():
+    yaml_path = Path(mm_mod.__file__).parents[1] / "mm_mthreads_expand.yaml"
+    loader = TunedConfigLoader()
+
+    non_ws = loader.ops_get_configs(
+        "mm_tle_non_ws_pipe", yaml_path=str(yaml_path)
+    )
+    ws = loader.ops_get_configs("mm_tle_ws_pipe", yaml_path=str(yaml_path))
+
+    assert len(non_ws) == 3840
+    assert len(ws) == 960
+    assert {config.kwargs["BLOCK_K"] for config in non_ws} == {32, 64, 128, 256}
+    assert {config.kwargs["NUM_SLOTS"] for config in non_ws} == {1, 2, 3, 4}
+    assert {config.kwargs["MMA_GROUP"] for config in non_ws} == {1, 2, 3, 4}
+    assert {config.kwargs["GROUP_M"] for config in non_ws} == {1, 2, 4, 8, 16}
+    assert {config.num_warps for config in non_ws} == {4, 8}
+    assert {config.kwargs["BLOCK_K"] for config in ws} == {32, 64, 128}
+    assert {config.kwargs["NUM_SLOTS"] for config in ws} == {1, 2, 3, 4}
+    assert {config.kwargs["MMA_GROUP"] for config in ws} == {1, 2, 3, 4}
+    assert {config.kwargs["GROUP_M"] for config in ws} == {1, 2, 4, 8, 16}
+    assert {config.num_warps for config in ws} == {16}
+
+
+def test_mm_mthreads_non_ws_expanded_enables_wide_eight_warp_tiles():
+    yaml_path = Path(mm_mod.__file__).parents[1] / "mm_mthreads_expand.yaml"
+    configs = TunedConfigLoader().ops_get_configs(
+        "mm_tle_non_ws_pipe", yaml_path=str(yaml_path)
+    )
+
+    narrow = mm_mod._prune_tle_non_ws_pipe_configs(
+        configs, {"M": 512, "N": 512, "K": 4096}
+    )
+    wide = mm_mod._prune_tle_non_ws_pipe_configs(
+        configs, {"M": 512, "N": 2560, "K": 4096}
+    )
+
+    assert {config.num_warps for config in narrow} == {4}
+    assert {config.num_warps for config in wide} == {4, 8}
+    assert all(
+        config.kwargs["BLOCK_N"] == 256
+        for config in wide
+        if config.num_warps == 8
+    )
+
+
+def test_mm_mthreads_tle_pipe_uses_expanded_configs_by_default(monkeypatch):
+    monkeypatch.delenv("USE_FLAGTUNE", raising=False)
+    monkeypatch.delenv("USE_FLAGTUNE_COST_MODEL", raising=False)
+    monkeypatch.delenv("FLAGTUNE_INCLUDE", raising=False)
+
+    for tuner in (mm_mod.mm_tle_non_ws_pipe_kernel, mm_mod.mm_tle_pipe_kernel):
+        assert tuner._flagtune_default_mode is mm_mod.runtime.TuningMode.EXPANDED
+
+
+@pytest.mark.parametrize(
+    ("op_name", "prune", "shape", "warp_specialized"),
+    [
+        (
+            "mm_tle_non_ws_pipe",
+            mm_mod._prune_tle_non_ws_pipe_configs,
+            (512, 512, 4096),
+            False,
+        ),
+        (
+            "mm_tle_ws_pipe",
+            mm_mod._prune_tle_ws_pipe_configs,
+            (16384, 9216, 2048),
+            True,
+        ),
+    ],
+)
+def test_mm_mthreads_tle_pipe_expanded_configs_are_shape_pruned(
+    op_name, prune, shape, warp_specialized
+):
+    yaml_path = Path(mm_mod.__file__).parents[1] / "mm_mthreads_expand.yaml"
+    configs = TunedConfigLoader().ops_get_configs(op_name, yaml_path=str(yaml_path))
+    M, N, K = shape
+    filtered = prune(configs, {"M": M, "N": N, "K": K})
+
+    assert filtered
+    assert len(filtered) < len(configs)
+    assert all(K % config.kwargs["BLOCK_K"] == 0 for config in filtered)
+    assert all(
+        config.kwargs["NUM_SLOTS"] <= K // config.kwargs["BLOCK_K"]
+        for config in filtered
+    )
+    assert all(
+        config.kwargs["MMA_GROUP"] <= config.kwargs["NUM_SLOTS"]
+        for config in filtered
+    )
+    assert all(
+        config.kwargs["GROUP_M"]
+        <= (M + config.kwargs["BLOCK_M"] - 1) // config.kwargs["BLOCK_M"]
+        for config in filtered
+    )
+    assert all(
+        K // config.kwargs["BLOCK_K"] < 4
+        or config.kwargs["NUM_SLOTS"] > 1
+        for config in filtered
+    )
+    assert all(
+        config.kwargs["BLOCK_K"] != 32 or K // 32 <= 64
+        for config in filtered
+    )
+    assert all(
+        config.kwargs["NUM_SLOTS"]
+        * (config.kwargs["BLOCK_M"] + config.kwargs["BLOCK_N"])
+        * config.kwargs["BLOCK_K"]
+        * 2
+        <= 192 * 1024
+        for config in filtered
+    )
+    expected_warps = 16 if warp_specialized else 4
+    assert {config.num_warps for config in filtered} == {expected_warps}
