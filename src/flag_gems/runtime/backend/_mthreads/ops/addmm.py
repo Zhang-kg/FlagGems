@@ -2377,9 +2377,7 @@ def _addmm_impl(bias, mat1, mat2, out, beta, alpha):
     # the wide-N validation shapes (the copy can be much larger than the GEMM).
     # The generic kernel already consumes this K-contiguous layout directly and
     # only copies it when a large M provides enough reuse to amortize the copy.
-    # It also avoids the descriptor/pipeline setup cost for the small-M core
-    # shapes, where one conventional dot tile covers the complete output row.
-    if (mat2.stride(0) == 1 and mat2.stride(1) > 1) or (M < 128 and N <= 4096):
+    if mat2.stride(0) == 1 and mat2.stride(1) > 1:
         return addmm_fma(bias, mat1, mat2, alpha=alpha, beta=beta, out=out)
 
     tle_result = try_addmm_tle(bias, mat1, mat2, out, beta, alpha)
