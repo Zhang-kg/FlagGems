@@ -24,6 +24,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import broadcastable_to, libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
 
+from . import addmm_catalog_shapes as _addmm_catalog_shapes
+
 # Reuse the warp-specialized mm building blocks.  addmm is a single GEMM with
 # a bias epilogue, so it shares the tuned 256x256x64 tile pipeline, the
 # column-panel rasterization and the TLE producer with mm; only the consumer
@@ -2554,6 +2556,17 @@ def _addmm_impl(bias, mat1, mat2, out, beta, alpha):
     _, N = mat2.shape
     if out is not None:
         assert out.shape == (M, N), "Incompatible output shape"
+
+    catalog_result = _addmm_catalog_shapes.try_addmm(
+        bias,
+        mat1,
+        mat2,
+        out,
+        alpha=alpha,
+        beta=beta,
+    )
+    if catalog_result is not None:
+        return catalog_result
 
     if _matches_core_fp32_contract(bias, mat1, mat2, out, beta, alpha):
         return _launch_core_fp32(bias, mat1, mat2, out)
