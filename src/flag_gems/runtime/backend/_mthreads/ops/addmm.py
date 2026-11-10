@@ -82,6 +82,17 @@ _ADDMM_TLE_ON = (
     and is_tle_supported(_ADDMM_TLE_PRIMITIVES)
 )
 
+# Direct GEMV configurations for the M=1/2 column-major shapes in the model
+# catalog.  The physical mat2 allocation is [N, K], so one program can reduce
+# a contiguous weight row without transposing or materializing the KxN view.
+_NT_GEMV_CONFIGS = {
+    (1, 64, 4096): (1, 2048, 4),
+    (2, 64, 4096): (1, 2048, 4),
+    (1, 256, 2048): (1, 1024, 2),
+    (1, 4096, 128): (16, 128, 4),
+    (1, 4, 16384): (1, 4096, 8),
+}
+
 
 EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "addmm_mthreads_expand.yaml")
@@ -260,6 +271,34 @@ def _launch_addmm_nt_gemv(
             num_stages=1,
         )
     return out
+
+
+def _nt_gemv_config(bias, mat1, mat2, out):
+    config = _NT_GEMV_CONFIGS.get(
+        (mat1.shape[0], mat2.shape[1], mat1.shape[1])
+    )
+    if config is None:
+        return None
+    m, k = mat1.shape
+    n = mat2.shape[1]
+    if not (
+        mat1.dtype in (torch.float16, torch.bfloat16)
+        and mat2.dtype == mat1.dtype
+        and bias.dtype == mat1.dtype
+        and mat1.stride(0) == k
+        and mat1.stride(1) == 1
+        and mat2.stride(0) == 1
+        and mat2.stride(1) == k
+    ):
+        return None
+    if out is not None and not (
+        out.dtype == mat1.dtype
+        and out.device == mat1.device
+        and out.shape == (m, n)
+        and out.is_contiguous()
+    ):
+        return None
+    return config
 
 
 @libentry()
@@ -2510,6 +2549,21 @@ def _addmm_impl(bias, mat1, mat2, out, beta, alpha):
         return _launch_core_fp32(bias, mat1, mat2, out)
     if _matches_core_half_dot_contract(bias, mat1, mat2, out, beta, alpha):
         return _launch_core_half_dot(bias, mat1, mat2, out)
+
+    nt_gemv_config = _nt_gemv_config(bias, mat1, mat2, out)
+    if nt_gemv_config is not None:
+        block_n, block_k, num_warps = nt_gemv_config
+        return _launch_addmm_nt_gemv(
+            bias,
+            mat1,
+            mat2,
+            out,
+            alpha,
+            beta,
+            block_n=block_n,
+            block_k=block_k,
+            num_warps=num_warps,
+        )
 
     # A logical KxN tensor obtained from an NxK contiguous allocation has
     # stride (1, K).  TensorDescriptor-based SQMMA paths currently materialize
