@@ -51,8 +51,66 @@ _CATALOG_CONFIGS = {
 _CATALOG_NT_GEMV_SHAPES = {(1, 64, 4096), (2, 16, 4096)}
 _CATALOG_PATH_PREFIX = "pr8526_"
 _CATALOG_NT_GEMV_PATH = "pr8526_nt_gemv"
+_CATALOG_GEMV4_SHAPE = (64, 4, 16384)
+_CATALOG_GEMV4_PATH = "pr8526_gemv4_bm1_bk2048_w4"
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+@triton.jit
+def _bmm_gemv4_kernel(
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    stride_ob,
+    stride_om,
+    stride_on,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Compute four output columns from either supported B layout."""
+
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    acc0 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        k = k_start + offs_k
+        a = tl.load(
+            a_ptr
+            + pid_b * stride_ab
+            + offs_m[:, None] * stride_am
+            + k[None, :] * stride_ak,
+            mask=offs_m[:, None] < M,
+            other=0.0,
+        ).to(tl.float32)
+        b_base = b_ptr + pid_b * stride_bb + k * stride_bk
+        b0 = tl.load(b_base).to(tl.float32)
+        b1 = tl.load(b_base + stride_bn).to(tl.float32)
+        b2 = tl.load(b_base + 2 * stride_bn).to(tl.float32)
+        b3 = tl.load(b_base + 3 * stride_bn).to(tl.float32)
+        acc0 += tl.sum(a * b0[None, :], axis=1)
+        acc1 += tl.sum(a * b1[None, :], axis=1)
+        acc2 += tl.sum(a * b2[None, :], axis=1)
+        acc3 += tl.sum(a * b3[None, :], axis=1)
+
+    out_base = out_ptr + pid_b * stride_ob + offs_m * stride_om
+    tl.store(out_base, acc0, mask=offs_m < M)
+    tl.store(out_base + stride_on, acc1, mask=offs_m < M)
+    tl.store(out_base + 2 * stride_on, acc2, mask=offs_m < M)
+    tl.store(out_base + 3 * stride_on, acc3, mask=offs_m < M)
 
 
 @triton.jit
@@ -334,7 +392,11 @@ def _catalog_inputs_eligible(a: torch.Tensor, b: torch.Tensor) -> bool:
         and a.shape[0] == b.shape[0]
         and a.shape[0] in (2, 4, 8)
         and a.shape[2] == b.shape[1]
-        and (shape in _CATALOG_CONFIGS or shape in _CATALOG_NT_GEMV_SHAPES)
+        and (
+            shape in _CATALOG_CONFIGS
+            or shape in _CATALOG_NT_GEMV_SHAPES
+            or shape == _CATALOG_GEMV4_SHAPE
+        )
         and a.dtype == b.dtype
         and a.dtype in (torch.float16, torch.bfloat16)
         and a.is_contiguous()
@@ -353,6 +415,11 @@ def dispatch_path(a: torch.Tensor, b: torch.Tensor) -> Optional[str]:
         and _is_upstream_transpose_view(b)
     ):
         return _CATALOG_NT_GEMV_PATH
+    if (
+        _catalog_inputs_eligible(a, b)
+        and (a.shape[1], b.shape[2], a.shape[2]) == _CATALOG_GEMV4_SHAPE
+    ):
+        return _CATALOG_GEMV4_PATH
     if _catalog_inputs_eligible(a, b):
         shape = (a.shape[1], b.shape[2], a.shape[2])
         trans_b = _is_upstream_transpose_view(b)
@@ -404,6 +471,30 @@ def launch(
     out: torch.Tensor,
 ) -> None:
     batch = a.shape[0]
+    if path == _CATALOG_GEMV4_PATH:
+        M, _, K = a.shape[1], b.shape[2], a.shape[2]
+        block_m = 1
+        _bmm_gemv4_kernel[(triton.cdiv(M, block_m), batch)](
+            a,
+            b,
+            out,
+            a.stride(0),
+            a.stride(1),
+            a.stride(2),
+            b.stride(0),
+            b.stride(1),
+            b.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            M=M,
+            K=K,
+            BLOCK_M=block_m,
+            BLOCK_K=2048,
+            num_warps=4,
+            num_stages=1,
+        )
+        return
     if path == _CATALOG_NT_GEMV_PATH:
         M, N, K = a.shape[1], b.shape[2], a.shape[2]
         block_k, num_warps = (2048, 4) if M == 1 else (1024, 2)
