@@ -112,6 +112,13 @@ _SMALL_M_TLE_SHAPES = {
     (64, 64, 4096),
     (64, 384, 7168),
     (64, 2560, 4096),
+    (100, 64, 4096),
+    (512, 256, 2048),
+    (512, 512, 512),
+}
+
+_SMALL_M_TLE_NT_ONLY_SHAPES = {
+    (144, 4096, 1024),
 }
 
 
@@ -601,9 +608,14 @@ def _launch_addmm_bm64_bn64_bk128_s2_small_m_ws(
 def _small_m_tle_eligible(bias, mat1, mat2, out):
     m, k = mat1.shape
     n = mat2.shape[1]
+    shape = (m, n, k)
+    trans_b = mat2.stride(0) == 1 and mat2.stride(1) == k
+    shape_supported = shape in _SMALL_M_TLE_SHAPES or (
+        shape in _SMALL_M_TLE_NT_ONLY_SHAPES and trans_b
+    )
     if (
         not _ADDMM_TLE_ON
-        or (m, n, k) not in _SMALL_M_TLE_SHAPES
+        or not shape_supported
         or mat1.dtype not in (torch.float16, torch.bfloat16)
         or mat2.dtype != mat1.dtype
         or bias.dtype != mat1.dtype
@@ -612,9 +624,7 @@ def _small_m_tle_eligible(bias, mat1, mat2, out):
         or not mat1.is_contiguous()
     ):
         return False
-    mat2_supported = mat2.is_contiguous() or (
-        mat2.stride(0) == 1 and mat2.stride(1) == k
-    )
+    mat2_supported = mat2.is_contiguous() or trans_b
     out_supported = out is None or (
         out.dtype == mat1.dtype
         and out.device == mat1.device
