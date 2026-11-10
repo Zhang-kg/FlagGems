@@ -39,6 +39,7 @@ _RUNTIME_BACKENDS = {
     "hip": _RuntimeBackend(
         ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
     ),
+    "musa": _RuntimeBackend(("MUSA_VISIBLE_DEVICES",)),
 }
 
 

@@ -14,7 +14,10 @@
 
 
 from .adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
+from .addmm import addmm, addmm_out
 from .addmm_ import addmm_
+from .baddbmm import baddbmm, baddbmm_out
+from .bmm import bmm, bmm_out
 from .broadcast_tensors import broadcast_tensors
 from .broadcast_to import broadcast_to
 from .conv_transpose1d import conv_transpose1d, conv_transpose1d_output_size
@@ -57,7 +60,13 @@ from .unbind_copy import unbind_copy
 
 __all__ = [
     "adaptive_max_pool3d_backward",
+    "addmm",
+    "addmm_out",
     "addmm_",
+    "baddbmm",
+    "baddbmm_out",
+    "bmm",
+    "bmm_out",
     "broadcast_tensors",
     "broadcast_to",
     "conv_transpose1d",

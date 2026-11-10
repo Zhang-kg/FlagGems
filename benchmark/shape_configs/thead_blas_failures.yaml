@@ -1,0 +1,24 @@
+addmm:
+  shapes:
+    - [1, 65536, 432, 1152]
+    - [1, 65536, 538, 1152]
+    - [1, 65536, 1152, 538]
+    - [1, 65536, 4304, 1152]
+  shape_desc: B, M, N, K
+
+bmm: &failure_shapes
+  shapes:
+    # Fixed-parameter split-K, regular autotuned, narrow-N, and large cases.
+    - [1, 144, 512, 4096]
+    - [4, 144, 512, 4096]
+    - [1, 384, 512, 4096]
+    - [1, 448, 7168, 256]
+    - [4, 448, 7168, 256]
+    - [1, 512, 7168, 1024]
+    - [1, 16384, 64, 2048]
+    - [4, 16384, 64, 2048]
+    - [1, 16384, 512, 7168]
+  shape_desc: B, M, N, K
+
+baddbmm:
+  <<: *failure_shapes

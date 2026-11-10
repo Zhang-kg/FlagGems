@@ -1,0 +1,22 @@
+mm:
+  shapes:
+    # Split-K shapes selected from the two requested Qwen3.5 count traces.
+    # The 35B trace has no shape currently routed to PPU split-K; all entries
+    # below come from Qwen3.5-397B-A17B-p65536d1024_count.yaml.
+    - [1, 32, 16, 4096]
+    - [1, 32, 256, 4096]
+    - [1, 32, 512, 4096]
+    - [1, 144, 512, 4096]
+    - [1, 384, 512, 4096]
+  shape_desc: B, M, N, K
+
+bmm:
+  shapes:
+    # Split-K hits from the representative with-batch shape set derived from
+    # the external model traces.
+    - [1, 144, 512, 4096]
+    - [1, 384, 512, 4096]
+    - [8, 384, 512, 4096]
+    - [1, 16384, 64, 2048]
+    - [2, 16384, 64, 2048]
+  shape_desc: B, M, N, K

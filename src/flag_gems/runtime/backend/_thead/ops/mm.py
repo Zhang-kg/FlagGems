@@ -15,12 +15,11 @@
 """PPU-specialized matrix multiplication.
 
 The tuner compares a no-wrap software-pipelined kernel with FlagTree TLE AIU
-and mixed-load variants. Unsupported layouts and unaligned problems retain the
-generic FlagGems implementation.
+and mixed-load variants. Unsupported layouts retain the generic FlagGems
+implementation; partial M/N/K tiles are handled in the PPU kernels.
 """
 
 import logging
-import os
 
 import torch
 import triton
@@ -32,55 +31,24 @@ from flag_gems.ops.mv import mv as _generic_mv
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 
-try:
-    import triton.experimental.tle.language as tle
-
-    HAS_PPU_TLE = True
-except ImportError:
-    tle = None
-    HAS_PPU_TLE = False
+from ._matmul_utils import (
+    EXPAND_CONFIG_FILENAME,
+    HAS_PPU_TLE,
+    _LOAD_A_AIU,
+    _LOAD_B_AIU,
+    _LOAD_BOTH_AIU,
+    _LOAD_REGULAR,
+    _SMALL_M_TILE,
+    _configs_from_specs,
+    _ppu_gemm_tile,
+    _ppu_bucket_strategy,
+    _prune_gemm_configs,
+    _prune_split_k_configs,
+    tle,
+)
 
 
 logger = logging.getLogger(__name__)
-EXPAND_CONFIG_FILENAME = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "mm_ppu_expand.yaml")
-)
-
-_LOAD_BOTH_AIU = 0
-_LOAD_A_AIU = 1
-_LOAD_B_AIU = 2
-_LOAD_REGULAR = 3
-_SMALL_M_TILE = 16
-
-
-def _configs_from_specs(specs, fields):
-    """Build Triton configs while keeping tuple shortlists easy to audit."""
-    configs = []
-    for spec in dict.fromkeys(specs):
-        kwargs = dict(zip(fields, spec))
-        num_warps = kwargs.pop("num_warps")
-        num_stages = kwargs.pop("num_stages")
-        kwargs["PIPE_STAGES"] = num_stages
-        configs.append(
-            triton.Config(
-                kwargs, num_warps=num_warps, num_stages=num_stages
-            )
-        )
-    return configs
-
-
-def _ppu_tuner(configs, expand_name):
-    return libtuner(
-        configs=configs,
-        key=["M", "N", "K"],
-        strategy=["default"] * 3,
-        warmup=5,
-        rep=10,
-        flagtune_op_name="mm",
-        flagtune_expand_op_name=expand_name,
-        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
-    )
-
 
 def _ppu_mm_configs():
     """A bounded search space covering PPU latency and throughput regimes."""
@@ -122,6 +90,8 @@ def _ppu_mm_configs():
         (256, 128, 64, 8, 2, 8, _LOAD_REGULAR),
         (128, 256, 64, 8, 2, 8, _LOAD_BOTH_AIU),
         (128, 256, 64, 8, 2, 8, _LOAD_REGULAR),
+        (64, 256, 64, 8, 2, 8, _LOAD_BOTH_AIU),
+        (64, 256, 64, 8, 2, 8, _LOAD_REGULAR),
         (128, 128, 64, 8, 2, 8, _LOAD_BOTH_AIU),
         (128, 128, 64, 8, 2, 8, _LOAD_REGULAR),
         (128, 64, 64, 8, 3, 8, _LOAD_BOTH_AIU),
@@ -274,6 +244,44 @@ def _ppu_gemv_configs():
     )
 
 
+def _ppu_split_k_configs():
+    """Candidate set formerly selected by the shape dispatch table."""
+    specs = (
+        (7, 16, 128, 64, 5, 4, _LOAD_BOTH_AIU, False),
+        (7, 32, 128, 64, 5, 4, _LOAD_BOTH_AIU, False),
+        (4, 64, 128, 64, 5, 4, _LOAD_BOTH_AIU, False),
+        (2, 32, 128, 64, 5, 4, _LOAD_BOTH_AIU, False),
+        (2, 64, 128, 64, 5, 4, _LOAD_BOTH_AIU, False),
+        (4, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, True),
+        (6, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, True),
+        (5, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, True),
+        (2, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, False),
+        (8, 16, 64, 32, 5, 4, _LOAD_REGULAR, False),
+        (2, 32, 128, 32, 5, 4, _LOAD_REGULAR, False),
+        (6, 64, 256, 32, 4, 4, _LOAD_B_AIU, True),
+    )
+    return _configs_from_specs(
+        specs,
+        (
+            "SPLIT_K",
+            "BLOCK_M",
+            "BLOCK_N",
+            "BLOCK_K",
+            "num_stages",
+            "num_warps",
+            "LOAD_MODE",
+            "INTERLEAVED",
+        ),
+    )
+
+
+def _ppu_split_k_reduce_configs():
+    return [
+        triton.Config({"BLOCK": block, "VEC": vec}, num_warps=warps, num_stages=1)
+        for block, vec, warps in ((128, 8, 4), (256, 4, 4))
+    ]
+
+
 if HAS_PPU_TLE:
 
     @libentry()
@@ -283,6 +291,9 @@ if HAS_PPU_TLE:
         strategy=["default", "default"],
         warmup=5,
         rep=20,
+        flagtune_op_name="mm",
+        flagtune_expand_op_name="gemv_ppu",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     )
     @triton.jit
     def gemv_kernel_ppu(
@@ -327,12 +338,25 @@ if HAS_PPU_TLE:
         )
 
     @libentry()
-    @_ppu_tuner(_ppu_mm_configs(), "mm_ppu")
+    @libtuner(
+        configs=_ppu_mm_configs(),
+        key=["FUSE_ADDMM", "M", "N", "K"],
+        strategy=["default", _ppu_bucket_strategy, _ppu_bucket_strategy, _ppu_bucket_strategy],
+        prune_configs_by={"early_config_prune": _prune_gemm_configs},
+        warmup=5,
+        rep=10,
+        flagtune_op_name="mm",
+        flagtune_expand_op_name="mm_ppu",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    )
     @triton.jit
     def mm_kernel_ppu(
         A,
         B,
         C,
+        Bias,
+        alpha,
+        beta,
         M,
         N,
         K,
@@ -342,6 +366,8 @@ if HAS_PPU_TLE:
         stride_bn,
         stride_cm,
         stride_cn,
+        stride_bias_m,
+        stride_bias_n,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -349,7 +375,9 @@ if HAS_PPU_TLE:
         LOAD_MODE: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
         EVEN_K: tl.constexpr,
-        EVEN_MN: tl.constexpr,
+        EVEN_M: tl.constexpr,
+        EVEN_N: tl.constexpr,
+        FUSE_ADDMM: tl.constexpr,
     ):
         pid = tl.program_id(0)
         grid_m = tl.cdiv(M, BLOCK_M)
@@ -360,98 +388,59 @@ if HAS_PPU_TLE:
         group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
         pid_m = group_id * GROUP_M + pid % group_size
         pid_n = (pid % width) // group_size
-
-        a_block_ptr = tl.make_block_ptr(
-            base=A,
-            shape=(M, K),
-            strides=(stride_am, stride_ak),
-            offsets=(pid_m * BLOCK_M, 0),
-            block_shape=(BLOCK_M, BLOCK_K),
-            order=(1, 0),
+        _ppu_gemm_tile(
+            A,
+            B,
+            C,
+            Bias,
+            alpha,
+            beta,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            stride_cm,
+            stride_cn,
+            stride_bias_m,
+            stride_bias_n,
+            pid_m,
+            pid_n,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            LOAD_MODE,
+            PIPE_STAGES,
+            False,
+            EVEN_K,
+            EVEN_M,
+            EVEN_N,
+            FUSE_ADDMM,
         )
-        b_block_ptr = tl.make_block_ptr(
-            base=B,
-            shape=(K, N),
-            strides=(stride_bk, stride_bn),
-            offsets=(0, pid_n * BLOCK_N),
-            block_shape=(BLOCK_K, BLOCK_N),
-            order=(1, 0),
-        )
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        # For regular loads, wrap only the final M/N tile and mask the store.
-        # This keeps every K-loop load in-bounds without carrying M/N masks
-        # through the PPU dot pipeline.  It is the same boundary strategy used
-        # by FlagGems' generic GEMM kernel.
-        wrapped_m = tl.max_contiguous(
-            tl.multiple_of(offs_m % M, BLOCK_M), BLOCK_M
-        ).to(tl.int64)
-        wrapped_n = tl.max_contiguous(
-            tl.multiple_of(offs_n % N, BLOCK_N), BLOCK_N
-        ).to(tl.int64)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        # PPU requires an explicit staged range for the load/dot loop.  Keeping
-        # PIPE_STAGES equal to the launch option makes the intended software
-        # pipeline visible to both Triton IR and the PPU backend.
-        for k_start in tl.range(0, K, BLOCK_K, num_stages=PIPE_STAGES):
-            if LOAD_MODE == 0 or LOAD_MODE == 1:
-                a = tle.load(
-                    a_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-            else:
-                offs_k = k_start + tl.arange(0, BLOCK_K)
-                a_ptrs = (
-                    A
-                    + wrapped_m[:, None] * stride_am
-                    + offs_k[None, :] * stride_ak
-                )
-                if EVEN_K:
-                    a = tl.load(a_ptrs)
-                else:
-                    a = tl.load(a_ptrs, mask=offs_k[None, :] < K, other=0.0)
-
-            if LOAD_MODE == 0 or LOAD_MODE == 2:
-                b = tle.load(
-                    b_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-            else:
-                offs_k = k_start + tl.arange(0, BLOCK_K)
-                b_ptrs = (
-                    B
-                    + offs_k[:, None] * stride_bk
-                    + wrapped_n[None, :] * stride_bn
-                )
-                if EVEN_K:
-                    b = tl.load(b_ptrs)
-                else:
-                    b = tl.load(b_ptrs, mask=offs_k[:, None] < K, other=0.0)
-
-            acc = tl.dot(a, b, acc=acc, out_dtype=tl.float32)
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
-
-        c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        if EVEN_MN:
-            tl.store(c_ptrs, acc.to(C.dtype.element_ty))
-        else:
-            tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=c_mask)
 
 
     @libentry()
-    @_ppu_tuner(_ppu_small_m_configs(), "mm_ppu_small_m")
+    @libtuner(
+        configs=_ppu_small_m_configs(),
+        key=["FUSE_ADDMM", "M", "N", "K"],
+        strategy=["default", _ppu_bucket_strategy, _ppu_bucket_strategy, _ppu_bucket_strategy],
+        prune_configs_by={"early_config_prune": _prune_gemm_configs},
+        warmup=5,
+        rep=10,
+        flagtune_op_name="mm",
+        flagtune_expand_op_name="mm_ppu_small_m",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    )
     @triton.jit
     def mm_small_m_kernel_ppu(
         A,
         B,
         C,
+        Bias,
+        alpha,
+        beta,
         M,
         N,
         K,
@@ -461,11 +450,15 @@ if HAS_PPU_TLE:
         stride_bn,
         stride_cm,
         stride_cn,
+        stride_bias_m,
+        stride_bias_n,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         LOAD_MODE: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
         EVEN_K: tl.constexpr,
+        EVEN_N: tl.constexpr,
+        FUSE_ADDMM: tl.constexpr,
     ):
         # M is deliberately represented by a literal physical tile.  AABS may
         # shrink tunable block sizes to the runtime tensor extent; for M < 16
@@ -475,84 +468,59 @@ if HAS_PPU_TLE:
         grid_n = tl.cdiv(N, BLOCK_N)
         pid_m = pid // grid_n
         pid_n = pid % grid_n
-
-        a_block_ptr = tl.make_block_ptr(
-            base=A,
-            shape=(M, K),
-            strides=(stride_am, stride_ak),
-            offsets=(pid_m * 16, 0),
-            block_shape=(16, BLOCK_K),
-            order=(1, 0),
+        _ppu_gemm_tile(
+            A,
+            B,
+            C,
+            Bias,
+            alpha,
+            beta,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            stride_cm,
+            stride_cn,
+            stride_bias_m,
+            stride_bias_n,
+            pid_m,
+            pid_n,
+            16,
+            BLOCK_N,
+            BLOCK_K,
+            LOAD_MODE,
+            PIPE_STAGES,
+            True,
+            EVEN_K,
+            False,
+            EVEN_N,
+            FUSE_ADDMM,
         )
-        b_block_ptr = tl.make_block_ptr(
-            base=B,
-            shape=(K, N),
-            strides=(stride_bk, stride_bn),
-            offsets=(0, pid_n * BLOCK_N),
-            block_shape=(BLOCK_K, BLOCK_N),
-            order=(1, 0),
-        )
-        offs_m = pid_m * 16 + tl.arange(0, 16)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        wrapped_n = tl.max_contiguous(
-            tl.multiple_of(offs_n % N, BLOCK_N), BLOCK_N
-        ).to(tl.int64)
-        acc = tl.zeros((16, BLOCK_N), dtype=tl.float32)
-
-        for k_start in tl.range(0, K, BLOCK_K, num_stages=PIPE_STAGES):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            if LOAD_MODE == 0 or LOAD_MODE == 1:
-                a = tle.load(
-                    a_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-            else:
-                a_ptrs = (
-                    A
-                    + offs_m[:, None] * stride_am
-                    + offs_k[None, :] * stride_ak
-                )
-                a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-                a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-
-            if LOAD_MODE == 0 or LOAD_MODE == 2:
-                b = tle.load(
-                    b_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-            else:
-                b_ptrs = (
-                    B
-                    + offs_k[:, None] * stride_bk
-                    + wrapped_n[None, :] * stride_bn
-                )
-                if EVEN_K:
-                    b = tl.load(b_ptrs)
-                else:
-                    b = tl.load(
-                        b_ptrs, mask=offs_k[:, None] < K, other=0.0
-                    )
-
-            acc = tl.dot(a, b, acc=acc, out_dtype=tl.float32)
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
-
-        c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=c_mask)
 
 
     @libentry()
-    @_ppu_tuner(_ppu_mid_m_configs(), "mm_ppu_mid_m")
+    @libtuner(
+        configs=_ppu_mid_m_configs(),
+        key=["FUSE_ADDMM", "M", "N", "K"],
+        strategy=["default", _ppu_bucket_strategy, _ppu_bucket_strategy, _ppu_bucket_strategy],
+        prune_configs_by={"early_config_prune": _prune_gemm_configs},
+        warmup=5,
+        rep=10,
+        flagtune_op_name="mm",
+        flagtune_expand_op_name="mm_ppu_mid_m",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    )
     @triton.jit
     def mm_mid_m_kernel_ppu(
         A,
         B,
         C,
+        Bias,
+        alpha,
+        beta,
         M,
         N,
         K,
@@ -562,87 +530,68 @@ if HAS_PPU_TLE:
         stride_bn,
         stride_cm,
         stride_cn,
+        stride_bias_m,
+        stride_bias_n,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         LOAD_MODE: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
         EVEN_K: tl.constexpr,
+        EVEN_N: tl.constexpr,
+        FUSE_ADDMM: tl.constexpr,
     ):
         # This route fixes BLOCK_M at the legal 32-row PPU dot tile.  It covers
         # every 16 < M < 32 input with one program, so a very wide B tile is
         # loaded only once.
         pid_n = tl.program_id(0)
-        a_block_ptr = tl.make_block_ptr(
-            base=A,
-            shape=(M, K),
-            strides=(stride_am, stride_ak),
-            offsets=(0, 0),
-            block_shape=(BLOCK_M, BLOCK_K),
-            order=(1, 0),
+        _ppu_gemm_tile(
+            A,
+            B,
+            C,
+            Bias,
+            alpha,
+            beta,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            stride_cm,
+            stride_cn,
+            stride_bias_m,
+            stride_bias_n,
+            0,
+            pid_n,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            LOAD_MODE,
+            PIPE_STAGES,
+            True,
+            EVEN_K,
+            False,
+            EVEN_N,
+            FUSE_ADDMM,
         )
-        b_block_ptr = tl.make_block_ptr(
-            base=B,
-            shape=(K, N),
-            strides=(stride_bk, stride_bn),
-            offsets=(0, pid_n * BLOCK_N),
-            block_shape=(BLOCK_K, BLOCK_N),
-            order=(1, 0),
-        )
-        offs_m = tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        wrapped_n = tl.max_contiguous(
-            tl.multiple_of(offs_n % N, BLOCK_N), BLOCK_N
-        ).to(tl.int64)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for k_start in tl.range(0, K, BLOCK_K, num_stages=PIPE_STAGES):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            if LOAD_MODE == 0 or LOAD_MODE == 1:
-                a = tle.load(
-                    a_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-            else:
-                a_ptrs = (
-                    A
-                    + offs_m[:, None] * stride_am
-                    + offs_k[None, :] * stride_ak
-                )
-                a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-                a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-
-            if LOAD_MODE == 0 or LOAD_MODE == 2:
-                b = tle.load(
-                    b_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-            else:
-                b_ptrs = (
-                    B
-                    + offs_k[:, None] * stride_bk
-                    + wrapped_n[None, :] * stride_bn
-                )
-                if EVEN_K:
-                    b = tl.load(b_ptrs)
-                else:
-                    b = tl.load(
-                        b_ptrs, mask=offs_k[:, None] < K, other=0.0
-                    )
-
-            acc = tl.dot(a, b, acc=acc, out_dtype=tl.float32)
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
-
-        c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=c_mask)
 
 
+    # PPU global-output atomics compile, but direct FP16 accumulation retained
+    # only 20-77% of this workspace path's throughput in the Qwen split-K set.
+    # BF16 also rounds every partial sum before the atomic and missed tolerance.
+    @libtuner(
+        configs=_ppu_split_k_configs(),
+        key=["M", "N", "K"],
+        strategy=[_ppu_bucket_strategy, _ppu_bucket_strategy, _ppu_bucket_strategy],
+        prune_configs_by={"early_config_prune": _prune_split_k_configs},
+        warmup=5,
+        rep=10,
+        flagtune_op_name="mm",
+        flagtune_expand_op_name="mm_ppu_split_k",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    )
     @triton.jit
     def mm_split_k_kernel_ppu(
         A,
@@ -737,7 +686,7 @@ if HAS_PPU_TLE:
                         a_ptrs, mask=offs_k[None, :] < K, other=0.0
                     )
                 else:
-                    a = tl.load(a_ptrs)
+                    a = tl.load(a_ptrs, mask=offs_k[None, :] < K, other=0.0)
             if LOAD_MODE == 0 or LOAD_MODE == 2:
                 b = tle.load(
                     b_block_ptr,
@@ -756,24 +705,34 @@ if HAS_PPU_TLE:
                         b_ptrs, mask=offs_k[:, None] < K, other=0.0
                     )
                 else:
-                    b = tl.load(b_ptrs)
+                    b = tl.load(b_ptrs, mask=offs_k[:, None] < K, other=0.0)
             acc = tl.dot(a, b, acc=acc, out_dtype=tl.float32)
             a_block_ptr = tl.advance(a_block_ptr, (0, k_advance))
             b_block_ptr = tl.advance(b_block_ptr, (k_advance, 0))
 
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         workspace_ptrs = (
             Workspace
             + split_id * M * N
             + offs_m[:, None] * N
             + offs_n[None, :]
         )
-        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         if EVEN_MN:
             tl.store(workspace_ptrs, acc)
         else:
             tl.store(workspace_ptrs, acc, mask=mask)
 
 
+    @libtuner(
+        configs=_ppu_split_k_reduce_configs(),
+        key=["n_elements"],
+        strategy=["default"],
+        warmup=5,
+        rep=10,
+        flagtune_op_name="mm",
+        flagtune_expand_op_name="mm_ppu_split_k_reduce",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    )
     @triton.jit
     def mm_split_k_reduce_kernel_ppu(
         Workspace,
@@ -793,9 +752,6 @@ if HAS_PPU_TLE:
         mask = offsets < n_elements
         acc = tl.zeros((BLOCK, VEC), dtype=tl.float32)
         workspace_ptrs = Workspace + offsets
-        # Mirror acBLAS's reduction schedule: process two adjacent slices per
-        # iteration and advance one base pointer.  This avoids rebuilding
-        # split_id * n_elements for every vector load in the generated ISA.
         for _ in range(SPLIT_K // 2):
             if EVEN_N:
                 x0 = tl.load(workspace_ptrs)
@@ -836,14 +792,14 @@ def _can_use_ppu_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> bool
     # The PPU kernel pads the final M/N tile on AIU loads, wraps regular-load
     # lanes, and masks stores, so M smaller than BLOCK_M is supported.  N=64 is
     # also a native production tile and must not be routed to the generic GEMM.
-    # The PPU AIU copy path requires at least 32-byte rows.  Keeping K aligned
-    # also prevents the compiler from shrinking BLOCK_K below the dot minimum.
+    # The PPU AIU copy path requires at least 32-byte rows. BLOCK_K is always a
+    # legal physical dot tile; boundary-checked AIU loads and masked regular
+    # loads zero-fill the final partial K tile.
     return (
         K == b_k
         and M >= 2
         and (N in (8, 16, 32, 64) or N >= 128)
         and K >= 32
-        and K % 16 == 0
         and a.data_ptr() % 32 == 0
         and b.data_ptr() % 32 == 0
         and out.data_ptr() % 32 == 0
@@ -861,6 +817,9 @@ def _run_ppu_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Te
             a,
             b,
             out,
+            out,
+            1.0,
+            0.0,
             M,
             N,
             K,
@@ -870,20 +829,83 @@ def _run_ppu_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Te
             b.stride(1),
             out.stride(0),
             out.stride(1),
+            out.stride(0),
+            out.stride(1),
             EVEN_K=K % 64 == 0,
             # All production tiles are at most 512 in M/N.  This conservative
             # predicate lets aligned large GEMMs omit the output mask without
             # coupling launch code to the autotuner-selected tile.
-            EVEN_MN=M % 512 == 0 and N % 512 == 0,
+            EVEN_M=M % 512 == 0,
+            EVEN_N=N % 512 == 0,
+            FUSE_ADDMM=False,
+        )
+    return out
+
+
+def _run_ppu_addmm(
+    bias: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    alpha,
+    beta,
+) -> torch.Tensor:
+    """Run the PPU GEMM with an in-kernel affine bias epilogue."""
+    M, K = a.shape
+    _, N = b.shape
+    if M < 32:
+        return _run_small_m_ppu_mm(
+            a,
+            b,
+            out,
+            bias=bias,
+            alpha=alpha,
+            beta=beta,
+        )
+    expanded_bias = bias.broadcast_to((M, N))
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
+    with torch_device_fn.device(a.device):
+        mm_kernel_ppu[grid](
+            a,
+            b,
+            out,
+            expanded_bias,
+            alpha,
+            beta,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            out.stride(0),
+            out.stride(1),
+            expanded_bias.stride(0),
+            expanded_bias.stride(1),
+            EVEN_K=K % 64 == 0,
+            EVEN_M=M % 512 == 0,
+            EVEN_N=N % 512 == 0,
+            FUSE_ADDMM=True,
         )
     return out
 
 
 def _run_small_m_ppu_mm(
-    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    bias: torch.Tensor | None = None,
+    alpha=1.0,
+    beta=0.0,
 ) -> torch.Tensor:
     M, K = a.shape
     _, N = b.shape
+    fuse_addmm = bias is not None
+    expanded_bias = bias.broadcast_to((M, N)) if fuse_addmm else out
     kernel = mm_small_m_kernel_ppu if M <= _SMALL_M_TILE else mm_mid_m_kernel_ppu
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
     with torch_device_fn.device(a.device):
@@ -891,6 +913,9 @@ def _run_small_m_ppu_mm(
             a,
             b,
             out,
+            expanded_bias,
+            alpha,
+            beta,
             M,
             N,
             K,
@@ -900,14 +925,22 @@ def _run_small_m_ppu_mm(
             b.stride(1),
             out.stride(0),
             out.stride(1),
+            expanded_bias.stride(0),
+            expanded_bias.stride(1),
             EVEN_K=K % 64 == 0,
+            EVEN_N=N % 512 == 0,
+            FUSE_ADDMM=fuse_addmm,
         )
     return out
 
 
-def _split_k_params(
-    M: int, N: int, K: int
-) -> tuple[int, int, int, int, int, int, int, bool] | None:
+def _should_use_split_k_mm(M: int, N: int, K: int) -> bool:
+    """Select split-K for known long-K wave regimes.
+
+    Tile, pipeline, load-mode, and split-count values are selected by the
+    split-K LibTuner candidates; this predicate only chooses the implementation
+    family.
+    """
     # Kimi K2.5's projection GEMMs use K=7168.  Timeline profiling shows that
     # acBLAS parallelizes K for these shapes, while the ordinary Triton route
     # leaves too few independent output tiles and serializes 112 BK=64 steps
@@ -916,57 +949,61 @@ def _split_k_params(
     # launch cost.  Wider/larger outputs switch to two or five slices so the
     # workspace traffic does not dominate.
     if K == 7168 and N in (384, 512):
+        # Workspace allocation dominates the split-K launch in this middle
+        # M band on PPU.  The regular kernel has the same four output waves
+        # without the reduction overhead, so keep split-K for the smaller and
+        # larger wave regimes where it provides real parallelism.
+        if N == 512 and 400 <= M < 512:
+            return False
         if M < 32:
-            block_m = 16 if M <= _SMALL_M_TILE else 32
-            return 7, block_m, 128, 64, 5, 4, _LOAD_BOTH_AIU, False
+            return True
         # M=32 already has a separately tuned eight-way route below.
         if 32 < M <= 64:
-            return 7, 32, 128, 64, 5, 4, _LOAD_BOTH_AIU, False
+            return True
         if 64 < M <= 128:
-            return 4, 64, 128, 64, 5, 4, _LOAD_BOTH_AIU, False
+            return True
         if 128 < M <= 256:
             # For N=512, eight 32-row M tiles times four N tiles times two
             # slices lands on a slow 64-program wave at M=232..256.  A 64-row
             # tile halves that grid and recovers the measured ~97% of acBLAS.
-            block_m = 64 if N == 512 and M >= 225 else 32
-            return 2, block_m, 128, 64, 5, 4, _LOAD_BOTH_AIU, False
+            return True
         if N == 512 and 256 < M <= 320:
-            return 2, 64, 128, 64, 5, 4, _LOAD_BOTH_AIU, False
+            return True
         # N=384 keeps three N tiles.  Four K slices fill the device efficiently
         # through M=384; after the next M-grid boundary six slices are faster.
         if N == 384 and 257 <= M <= 384:
-            return 4, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, True
+            return True
         if N == 384 and 432 <= M <= 512:
-            return 6, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, True
+            return True
         # N=512 has a different grid-wave boundary: six slices win while there
         # are three M tiles, whereas five win again once there are four.
         if N == 512 and 336 <= M <= 384:
-            return 6, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, True
-        if N == 512 and 464 <= M <= 512:
-            return 5, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, True
+            return True
+        if N == 512 and 464 <= M < 512:
+            return True
 
     # For Kimi's wider gate projection, the output grid already supplies most
     # of the parallelism.  Two K slices with a larger M tile match the profiled
     # acBLAS schedule and remove the remaining long-K tail.
     if K == 7168 and N == 2112 and 200 <= M <= 256:
-        return 2, 128, 128, 32, 5, 4, _LOAD_BOTH_AIU, False
+        return True
 
     if K % 256 != 0 or N > 512:
-        return None
+        return False
     if M == 32 and K >= 4096:
-        return 8, 16, 64, 32, 5, 4, _LOAD_REGULAR, False
+        return True
     # Torch PPU uses parallel split-K for both shapes.  Replaying its large AIU
     # tiles directly is slower in Triton because the backend does not reproduce
     # acBLAS's explicit shared-memory swizzle/register pipeline.  These smaller
     # tiles are the measured Triton winners around the vendor slice strategy.
     if M == 144 and N == 512 and K == 4096:
-        return 2, 32, 128, 32, 5, 4, _LOAD_REGULAR, False
+        return True
     if M == 384 and N == 512 and K == 4096:
         # Match acBLAS's six-way K parallelism.  Keeping A on the regular load
         # path and B on AIU avoids the small-A AIU setup cost while retaining
         # asynchronous reuse of the much wider B tile.
-        return 6, 64, 256, 32, 4, 4, _LOAD_B_AIU, True
-    return None
+        return True
+    return False
 
 
 def _run_split_k_mm(
@@ -974,27 +1011,19 @@ def _run_split_k_mm(
 ) -> torch.Tensor:
     M, K = a.shape
     _, N = b.shape
-    params = _split_k_params(M, N, K)
-    assert params is not None
-    (
-        split_k,
-        block_m,
-        block_n,
-        block_k,
-        stages,
-        warps,
-        load_mode,
-        interleaved,
-    ) = params
-    workspace = torch.empty(
-        (split_k, M, N), device=out.device, dtype=torch.float32
+    # The tuner updates ``best_config`` inside the kernel launch.  It may still
+    # contain the winner for a previous shape before this call, so allocate the
+    # bounded maximum up front and read the active split count afterwards.
+    max_split_k = max(
+        config.kwargs["SPLIT_K"] for config in _ppu_split_k_configs()
     )
-    # The same 1024 elements/program layout can be represented as 128x8 or
-    # 256x4.  PPU measurements show that the latter lowers the reduction tail
-    # for large workspaces without changing grid size, while 128x8 retains the
-    # lower launch cost for small-M outputs.
-    reduce_block, reduce_vec = (256, 4) if M * N >= 128 * 1024 else (128, 8)
-    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), split_k)
+    workspace = torch.empty(
+        (max_split_k, M, N), device=out.device, dtype=torch.float32
+    )
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        META["SPLIT_K"],
+    )
     with torch_device_fn.device(a.device):
         mm_split_k_kernel_ppu[grid](
             a,
@@ -1007,29 +1036,20 @@ def _run_split_k_mm(
             a.stride(1),
             b.stride(0),
             b.stride(1),
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            SPLIT_K=split_k,
-            INTERLEAVED=interleaved,
-            LOAD_MODE=load_mode,
-            PIPE_STAGES=stages,
-            EVEN_MN=M % block_m == 0 and N % block_n == 0,
-            num_warps=warps,
-            num_stages=stages,
+            EVEN_MN=False,
+        )
+        split_k = mm_split_k_kernel_ppu.best_config.kwargs["SPLIT_K"]
+        reduce_grid = lambda META: (
+            triton.cdiv(M * N, META["BLOCK"] * META["VEC"]),
         )
         mm_split_k_reduce_kernel_ppu[
-            (triton.cdiv(M * N, reduce_block * reduce_vec),)
+            reduce_grid
         ](
             workspace,
             out,
             M * N,
             SPLIT_K=split_k,
-            BLOCK=reduce_block,
-            VEC=reduce_vec,
-            EVEN_N=(M * N) % (reduce_block * reduce_vec) == 0,
-            num_warps=4,
-            num_stages=1,
+            EVEN_N=False,
         )
     return out
 
@@ -1039,7 +1059,7 @@ def mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim == 2 and b.ndim == 2 and a.shape[1] == b.shape[0] and a.dtype == b.dtype:
         out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=a.dtype)
         if _can_use_ppu_mm(a, b, out):
-            if _split_k_params(a.shape[0], b.shape[1], a.shape[1]) is not None:
+            if _should_use_split_k_mm(a.shape[0], b.shape[1], a.shape[1]):
                 return _run_split_k_mm(a, b, out)
             if a.shape[0] < 32:
                 return _run_small_m_ppu_mm(a, b, out)
@@ -1050,7 +1070,7 @@ def mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def mm_out(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
     logger.debug("GEMS_THEAD MM_OUT")
     if _can_use_ppu_mm(a, b, out):
-        if _split_k_params(a.shape[0], b.shape[1], a.shape[1]) is not None:
+        if _should_use_split_k_mm(a.shape[0], b.shape[1], a.shape[1]):
             return _run_split_k_mm(a, b, out)
         if a.shape[0] < 32:
             return _run_small_m_ppu_mm(a, b, out)

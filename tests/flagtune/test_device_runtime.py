@@ -48,6 +48,7 @@ class _FakeTorch:
 
     def __init__(self, api):
         self.cuda = api
+        self.musa = api
 
     @staticmethod
     def device(device_type, index):
@@ -59,12 +60,17 @@ class _FakeTorch:
 
 
 def _descriptor(backend="cuda"):
+    is_musa = backend == "musa"
     return DeviceDescriptor(
         backend=backend,
-        vendor="nvidia" if backend == "cuda" else "amd",
-        torch_device_type="cuda",
+        vendor=(
+            "mthreads" if is_musa else "nvidia" if backend == "cuda" else "amd"
+        ),
+        torch_device_type="musa" if is_musa else "cuda",
         device_name="Test GPU",
-        architecture="sm90" if backend == "cuda" else "gfx942",
+        architecture=(
+            "ph1" if is_musa else "sm90" if backend == "cuda" else "gfx942"
+        ),
         device_index=0,
     )
 
@@ -100,6 +106,26 @@ def test_hip_runtime_uses_rocm_visibility_names_without_changing_torch_api():
     assert runtime.visible_device_tokens(1, environ={"ROCR_VISIBLE_DEVICES": "6"}) == [
         "6"
     ]
+
+
+def test_musa_runtime_uses_musa_api_and_visibility():
+    api = _FakeDeviceAPI()
+    runtime = DeviceRuntime(_descriptor("musa"), _FakeTorch(api))
+    environment = {"CUDA_VISIBLE_DEVICES": "5"}
+
+    assert runtime.visible_device_tokens(
+        2, environ={"MUSA_VISIBLE_DEVICES": "2,6"}
+    ) == ["2", "6"]
+    runtime.apply_worker_visibility(environment, "6")
+    runtime.set_device(1)
+    tensor = runtime.make_tensor("empty", (4, 8), dtype=runtime.dtype("bfloat16"))
+
+    assert environment == {
+        "CUDA_VISIBLE_DEVICES": "5",
+        "MUSA_VISIBLE_DEVICES": "6",
+    }
+    assert api.selected == 1
+    assert tensor["device"] == ("musa", 0)
 
 
 def test_runtime_rejects_missing_or_empty_device_api():

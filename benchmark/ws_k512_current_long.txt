@@ -1,0 +1,3 @@
+dtype	M	N	K	torch_ms	triton_ms	ratio	dispatch	status
+bf16	512	2048	512	0.021280	0.014038	1.515919	general_tle_ws	ok
+fp16	512	2048	512	0.013605	0.026130	0.520677	general_tle_ws	ok

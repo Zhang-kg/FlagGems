@@ -20,8 +20,9 @@ Environment variables:
   * ``FLAGGEMS_DB_URL`` is the inherited database URL when ``--database`` is
     absent; ``FLAGGEMS_CACHE_DIR`` chooses the default SQLite cache directory.
   * Backend visibility variables such as ``CUDA_VISIBLE_DEVICES``,
-    ``ROCR_VISIBLE_DEVICES``, and ``HIP_VISIBLE_DEVICES`` limit visible device
-    tokens and are captured in the run manifest.
+    ``ROCR_VISIBLE_DEVICES``, ``HIP_VISIBLE_DEVICES``, and
+    ``MUSA_VISIBLE_DEVICES`` limit visible device tokens and are captured in
+    the run manifest.
   * ``USE_FLAGTUNE`` selects FlagGems' Default or FlagTune routing, while
     ``FLAGTUNE_INCLUDE`` selects individual operators for capability-based tuning.
   * ``USE_FLAGTUNE_COST_MODEL``, ``FLAGTUNE_DISABLE_OPS``,
@@ -110,6 +111,7 @@ STRATEGY_ENV_NAMES = (
     "CUDA_VISIBLE_DEVICES",
     "ROCR_VISIBLE_DEVICES",
     "HIP_VISIBLE_DEVICES",
+    "MUSA_VISIBLE_DEVICES",
 )
 
 

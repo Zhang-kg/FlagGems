@@ -369,6 +369,7 @@ class LibTuner(triton.runtime.Autotuner):
         flagtune_variant=None,
         flagtune_yaml_path=None,
         flagtune_dtype_resolver=None,
+        flagtune_default_mode=runtime.TuningMode.DEFAULT,
     ):
         """Initialize library autotuning and optional FlagTune integration.
 
@@ -391,6 +392,8 @@ class LibTuner(triton.runtime.Autotuner):
                 the proposer when they do not already provide one.
             flagtune_dtype_resolver: Optional trusted Python callable returning
                 tensor dtypes in model identity order. YAML cannot set it.
+            flagtune_default_mode: Mode used when no global or per-operator
+                selection is present. Explicit environment settings override it.
 
         Notes:
             ``USE_FLAGTUNE=0`` selects Default. ``USE_FLAGTUNE=1`` selects
@@ -506,6 +509,7 @@ class LibTuner(triton.runtime.Autotuner):
         self._flagtune_op_id = flagtune_op_id
         self._flagtune_variant = flagtune_variant
         self._flagtune_mode = runtime.TuningMode.DEFAULT
+        self._flagtune_default_mode = runtime.TuningMode(flagtune_default_mode)
         self._flagtune_yaml_path = flagtune_yaml_path
         self._flagtune_pre_hook = flagtune_pre_hook
         if flagtune_dtype_resolver is not None and not callable(
@@ -572,6 +576,9 @@ class LibTuner(triton.runtime.Autotuner):
         mode = runtime.resolve_tuning_mode(
             op_name,
             supports_cost_model=supports_cost_model,
+            default_mode=getattr(
+                self, "_flagtune_default_mode", runtime.TuningMode.DEFAULT
+            ),
         )
         if mode is self._flagtune_mode:
             return False
@@ -1361,6 +1368,34 @@ def align32_strategy(key: Union[int, float]) -> int:
     return math.ceil(key / 32) * 32
 
 
+@LibTuner.register_strategy("mthreads_mm_bucket")
+def mthreads_mm_bucket_strategy(key: Union[int, float]) -> int:
+    """Conservatively coarsen MTT TLE GEMM cache keys.
+
+    TLE kernels use 32-aligned tiles, so nearby dimensions have identical
+    tile-count and descriptor constraints.  A few boundaries change pruning
+    or dispatch behavior, however, and therefore must remain separate.  The
+    returned value is negative so it cannot collide with the historical exact
+    positive-integer cache keys, while remaining portable across SQL backends
+    that infer key column types from the first inserted key.
+    """
+    value = int(key)
+    if value <= 0:
+        return value
+    aligned = align32_strategy(value)
+    if value < 256:
+        return -aligned
+    if value == 256:
+        return -1_000_256
+    if value < 512:
+        return -2_000_000 - aligned
+    if value == 512:
+        return -3_000_512
+    if value < 2048:
+        return -4_000_000 - aligned
+    return -5_000_000 - aligned
+
+
 @LibTuner.register_policy("default")
 def default_policy(
     self,
@@ -1442,6 +1477,7 @@ def libtuner(
     flagtune_yaml_path=None,
     flagtune_pre_hook=None,
     flagtune_dtype_resolver=None,
+    flagtune_default_mode=runtime.TuningMode.DEFAULT,
 ):
     """Decorator for triton library autotuner.
 
@@ -1469,6 +1505,8 @@ def libtuner(
         flagtune_pre_hook: Hook copied to proposer-created Config objects.
         flagtune_dtype_resolver: Optional trusted code-side callable returning
             tensor dtypes in identity order.
+        flagtune_default_mode: Per-tuner mode used when no runtime selection is
+            present. Explicit environment settings retain precedence.
 
     Returns:
         A decorator that constructs the selected ``LibTuner`` policy class.
@@ -1514,6 +1552,7 @@ def libtuner(
             flagtune_op_id=flagtune_op_id,
             flagtune_variant=flagtune_variant,
             flagtune_dtype_resolver=flagtune_dtype_resolver,
+            flagtune_default_mode=flagtune_default_mode,
         )
 
     return decorator

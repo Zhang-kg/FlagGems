@@ -28,19 +28,31 @@ from flag_gems.utils import triton_lang_extension as tle
 logger = logging.getLogger(__name__)
 
 
+def _get_matmuladd_tuning():
+    default_configs = runtime.get_tuned_config("addmm")
+    default_strategy = ["align32", "align32", "align32"]
+    if os.environ.get("USE_FLAGTUNE") != "1":
+        return default_configs, default_strategy
+
+    expand_config = runtime.get_expand_config("addmm")
+    expanded_configs = runtime.ops_get_configs("addmm", pre_hook=None)
+    if expand_config != -1 and expanded_configs:
+        return expanded_configs, expand_config["strategy"]
+
+    logger.warning(
+        "FlagTune expand config is unavailable for matmuladd; using default configs."
+    )
+    return default_configs, default_strategy
+
+
+_MATMULADD_CONFIGS, _MATMULADD_STRATEGY = _get_matmuladd_tuning()
+
+
 @libentry()
 @libtuner(
-    configs=(
-        runtime.ops_get_configs("addmm", pre_hook=None)
-        if os.environ.get("USE_FLAGTUNE") == "1"
-        else runtime.get_tuned_config("addmm")
-    ),
+    configs=_MATMULADD_CONFIGS,
     key=["M", "N", "K"],
-    strategy=(
-        runtime.get_expand_config("addmm")["strategy"]
-        if os.environ.get("USE_FLAGTUNE") == "1"
-        else ["align32", "align32", "align32"]
-    ),
+    strategy=_MATMULADD_STRATEGY,
     warmup=5,
     rep=10,
 )

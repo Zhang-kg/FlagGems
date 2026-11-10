@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
 
@@ -25,6 +27,32 @@ MNK_SHAPES = [
     (15, 160, 1024),
     (495, 5333, 71),
 ]
+
+
+def test_matmuladd_missing_expand_config_falls_back(monkeypatch):
+    matmuladd_mod = importlib.import_module("flag_gems.fused.matmuladd")
+    default_configs = [object()]
+    monkeypatch.setenv("USE_FLAGTUNE", "1")
+    monkeypatch.setattr(
+        matmuladd_mod.runtime,
+        "get_tuned_config",
+        lambda op_name: default_configs,
+    )
+    monkeypatch.setattr(
+        matmuladd_mod.runtime,
+        "get_expand_config",
+        lambda op_name: -1,
+    )
+    monkeypatch.setattr(
+        matmuladd_mod.runtime,
+        "ops_get_configs",
+        lambda op_name, pre_hook: [],
+    )
+
+    configs, strategy = matmuladd_mod._get_matmuladd_tuning()
+
+    assert configs is default_configs
+    assert strategy == ["align32", "align32", "align32"]
 
 
 def make_out(M, N, dtype, is_contiguous):

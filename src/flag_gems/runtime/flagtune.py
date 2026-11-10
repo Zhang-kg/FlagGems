@@ -189,7 +189,12 @@ def get_flagtune_include():
     return _include_from_env()
 
 
-def resolve_tuning_mode(op_name, *, supports_cost_model=False):
+def resolve_tuning_mode(
+    op_name,
+    *,
+    supports_cost_model=False,
+    default_mode=TuningMode.DEFAULT,
+):
     """Resolve Default, Expanded, or Cost Model tuning for one operator.
 
     ``USE_FLAGTUNE=0`` selects the default config space. ``USE_FLAGTUNE=1``
@@ -199,9 +204,13 @@ def resolve_tuning_mode(op_name, *, supports_cost_model=False):
     applies the same capability-based selection to individual operators. An
     adapted operator uses Expanded only when ``USE_FLAGTUNE_COST_MODEL=0``. If
     the active platform has no model package, it follows the unadapted routes.
+    ``default_mode`` lets an individual tuner opt into Expanded when no global
+    or per-operator switch selects a mode. Explicit environment settings still
+    take precedence.
     """
     try:
         name = _normalize_op_name(op_name)
+        default_mode = TuningMode(default_mode)
     except (TypeError, ValueError):
         return TuningMode.DEFAULT
 
@@ -236,7 +245,7 @@ def resolve_tuning_mode(op_name, *, supports_cost_model=False):
         return TuningMode.COST_MODEL
     if use_flagtune_setting is True or name in get_flagtune_include():
         return TuningMode.EXPANDED
-    return TuningMode.DEFAULT
+    return default_mode
 
 
 def flagtune_enabled(op_name):

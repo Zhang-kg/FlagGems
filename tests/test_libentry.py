@@ -153,6 +153,30 @@ def test_tuning_mode_environment_matrix(
 
 
 @pytest.mark.parametrize(
+    ("use_flagtune", "expected"),
+    [(None, "expanded"), ("0", "default"), ("1", "expanded")],
+)
+def test_tuning_mode_supports_per_tuner_expanded_default(
+    monkeypatch, use_flagtune, expected
+):
+    monkeypatch.setattr(flagtune_runtime_mod, "_include_ops", None)
+    monkeypatch.delenv("FLAGTUNE_INCLUDE", raising=False)
+    monkeypatch.delenv("USE_FLAGTUNE_COST_MODEL", raising=False)
+    if use_flagtune is None:
+        monkeypatch.delenv("USE_FLAGTUNE", raising=False)
+    else:
+        monkeypatch.setenv("USE_FLAGTUNE", use_flagtune)
+
+    mode = flagtune_runtime_mod.resolve_tuning_mode(
+        "mm",
+        supports_cost_model=False,
+        default_mode=flagtune_runtime_mod.TuningMode.EXPANDED,
+    )
+
+    assert mode.value == expected
+
+
+@pytest.mark.parametrize(
     ("use_flagtune", "use_cost_model", "expected"),
     [
         (None, None, "default"),

@@ -199,6 +199,32 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
+        if op_name in ("mm_tle_non_ws_pipe", "mm_tle_ws_pipe"):
+            mma_group_values = ranges.get("MMA_GROUP", [1])
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "NUM_SLOTS": num_slots,
+                        "MMA_GROUP": mma_group,
+                        "GROUP_M": group_m,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for num_slots in ranges["NUM_SLOTS"]
+                for mma_group in mma_group_values
+                for group_m in ranges["GROUP_M"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
         if op_name == "mm":
             has_pipeline = "PIPELINE" in ranges
             has_scenario = "SCENARIO" in ranges
@@ -226,7 +252,7 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "mm_ppu":
+        if op_name in ("mm_ppu", "bmm_ppu"):
             # PPU num_stages controls both Triton's software-pipeline option
             # and the explicit tl.range PIPE_STAGES constexpr.  Generate them
             # from the same loop variable instead of taking an accidental
@@ -276,7 +302,11 @@ class TunedConfigLoader(object):
                                         )
             return configs
 
-        if op_name in ("mm_ppu_small_m", "mm_ppu_mid_m"):
+        if op_name in (
+            "mm_ppu_small_m",
+            "mm_ppu_mid_m",
+            "bmm_ppu_small_m",
+        ):
             configs = []
             element_bytes = 2
             shared_memory_budget = 240 * 1024
@@ -317,6 +347,47 @@ class TunedConfigLoader(object):
                                     )
                                 )
             return configs
+
+        if op_name in ("mm_ppu_split_k", "bmm_ppu_split_k"):
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "SPLIT_K": split_k,
+                        "LOAD_MODE": load_mode,
+                        "INTERLEAVED": interleaved,
+                        "PIPE_STAGES": stages,
+                    },
+                    num_stages=stages,
+                    num_warps=warps,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for split_k in ranges["SPLIT_K"]
+                for load_mode in ranges["LOAD_MODE"]
+                for interleaved in ranges["INTERLEAVED"]
+                for stages in ranges["s"]
+                for warps in ranges["w"]
+                if split_k > 0
+            ]
+
+        if op_name in ("mm_ppu_split_k_reduce", "bmm_ppu_split_k_reduce"):
+            return [
+                triton.Config(
+                    {"BLOCK": block, "VEC": vec},
+                    num_stages=stages,
+                    num_warps=warps,
+                    pre_hook=pre_hook,
+                )
+                for block in ranges["BLOCK"]
+                for vec in ranges["VEC"]
+                for stages in ranges["s"]
+                for warps in ranges["w"]
+            ]
 
         if op_name in ("mm_nn", "mm_nt"):
             # "scenario" is optional so older expand yamls stay loadable, but
@@ -366,7 +437,7 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name in ("gemv", "gemv_k_parallel"):
+        if op_name in ("gemv", "gemv_ppu", "gemv_k_parallel"):
             return [
                 triton.Config(
                     {"BLOCK_M": block_m, "BLOCK_K": block_k},
@@ -672,6 +743,12 @@ class TunedConfigLoader(object):
                 ),
             ),
             "gemv": self._build_single_expand_spec("gemv"),
+            "gemv_ppu": {
+                "yaml_op_name": "gemv_ppu",
+                "key": ["M", "K"],
+                "default_strategy": ["default"] * 2,
+                "expand_yaml_path": None,
+            },
             "gemv_k_parallel": self._build_single_expand_spec(
                 "gemv", yaml_op_name="gemv_k_parallel"
             ),
@@ -680,20 +757,56 @@ class TunedConfigLoader(object):
             ),
             "mm_ppu": {
                 "yaml_op_name": "mm_ppu",
-                "key": ["M", "N", "K"],
-                "default_strategy": ["default", "default", "default"],
+                "key": ["FUSE_ADDMM", "M", "N", "K"],
+                "default_strategy": ["default"] * 4,
                 "expand_yaml_path": None,
             },
             "mm_ppu_small_m": {
                 "yaml_op_name": "mm_ppu_small_m",
-                "key": ["M", "N", "K"],
-                "default_strategy": ["default", "default", "default"],
+                "key": ["FUSE_ADDMM", "M", "N", "K"],
+                "default_strategy": ["default"] * 4,
                 "expand_yaml_path": None,
             },
             "mm_ppu_mid_m": {
                 "yaml_op_name": "mm_ppu_mid_m",
+                "key": ["FUSE_ADDMM", "M", "N", "K"],
+                "default_strategy": ["default"] * 4,
+                "expand_yaml_path": None,
+            },
+            "bmm_ppu": {
+                "yaml_op_name": "bmm_ppu",
+                "key": ["FUSE_BIAS", "batch", "M", "N", "K"],
+                "default_strategy": ["default"] * 5,
+                "expand_yaml_path": None,
+            },
+            "bmm_ppu_small_m": {
+                "yaml_op_name": "bmm_ppu_small_m",
+                "key": ["FUSE_BIAS", "batch", "M", "N", "K"],
+                "default_strategy": ["default"] * 5,
+                "expand_yaml_path": None,
+            },
+            "mm_ppu_split_k": {
+                "yaml_op_name": "mm_ppu_split_k",
                 "key": ["M", "N", "K"],
-                "default_strategy": ["default", "default", "default"],
+                "default_strategy": ["default"] * 3,
+                "expand_yaml_path": None,
+            },
+            "mm_ppu_split_k_reduce": {
+                "yaml_op_name": "mm_ppu_split_k_reduce",
+                "key": ["n_elements"],
+                "default_strategy": ["default"],
+                "expand_yaml_path": None,
+            },
+            "bmm_ppu_split_k": {
+                "yaml_op_name": "bmm_ppu_split_k",
+                "key": ["batch", "M", "N", "K"],
+                "default_strategy": ["default"] * 4,
+                "expand_yaml_path": None,
+            },
+            "bmm_ppu_split_k_reduce": {
+                "yaml_op_name": "bmm_ppu_split_k_reduce",
+                "key": ["M", "N", "total_elements"],
+                "default_strategy": ["default"] * 3,
                 "expand_yaml_path": None,
             },
             "mm_nn": self._build_single_expand_spec("mm_nn"),
@@ -705,6 +818,18 @@ class TunedConfigLoader(object):
                 "mm_sqmma", yaml_op_name="mm_general_tma"
             ),
             "mm_general_tma": self._build_single_expand_spec("mm_general_tma"),
+            "mm_tle_non_ws_pipe": {
+                "yaml_op_name": "mm_tle_non_ws_pipe",
+                "key": ["M", "N", "K"],
+                "default_strategy": ["default"] * 3,
+                "expand_yaml_path": None,
+            },
+            "mm_tle_ws_pipe": {
+                "yaml_op_name": "mm_tle_ws_pipe",
+                "key": ["M", "N", "K"],
+                "default_strategy": ["default"] * 3,
+                "expand_yaml_path": None,
+            },
             "mv": self._build_single_expand_spec(
                 "mv", expand_yaml_path=self._get_expand_config_path("mv")
             ),

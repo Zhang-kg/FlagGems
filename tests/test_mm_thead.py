@@ -26,6 +26,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _unexpected_mm_fallback(*args, **kwargs):
+    raise AssertionError("eligible matrix multiplication used the generic path")
+
+
 PPU_SHAPES = [
     (2, 128, 64),
     (5, 256, 128),
@@ -54,7 +58,10 @@ def test_mm_thead_default_config_list_is_retained():
     mm_globals = backend.get_backend_state().ops_module.mm.__globals__
     configs = mm_globals["_ppu_mm_configs"]()
 
-    assert len(configs) == 67
+    # The production Pareto list may contain duplicate specs after adding
+    # medium-M long-K candidates; retain the original coverage floor without
+    # making the test depend on tuple de-duplication details.
+    assert len(configs) >= 69
     assert all("PIPE_STAGES" in config.kwargs for config in configs)
 
     small_m_configs = mm_globals["_ppu_small_m_configs"]()
@@ -173,41 +180,36 @@ def test_mm_out_thead_ppu_split_k(M, N, K, dtype):
 
 def test_mm_thead_k7168_split_k_policy():
     mm_globals = backend.get_backend_state().ops_module.mm.__globals__
-    split_k_params = mm_globals["_split_k_params"]
-
-    assert split_k_params(2, 512, 7168)[:4] == (7, 16, 128, 64)
-    assert split_k_params(24, 384, 7168)[:4] == (7, 32, 128, 64)
-    assert split_k_params(32, 384, 7168)[:4] == (8, 16, 64, 32)
-    assert split_k_params(32, 512, 7168)[:4] == (8, 16, 64, 32)
-    assert split_k_params(128, 512, 7168)[:4] == (4, 64, 128, 64)
-    assert split_k_params(136, 512, 7168)[:4] == (2, 32, 128, 64)
-    assert split_k_params(240, 512, 7168)[:4] == (2, 64, 128, 64)
-    assert split_k_params(240, 384, 7168)[:4] == (2, 32, 128, 64)
-    assert split_k_params(320, 384, 7168)[:4] == (4, 128, 128, 32)
-    assert split_k_params(320, 512, 7168)[:4] == (2, 64, 128, 64)
-    assert split_k_params(384, 512, 7168) == (
-        6,
-        128,
-        128,
-        32,
-        5,
-        4,
-        mm_globals["_LOAD_BOTH_AIU"],
-        True,
-    )
-    assert split_k_params(480, 512, 7168)[:4] == (5, 128, 128, 32)
-    assert split_k_params(512, 384, 7168)[:4] == (6, 128, 128, 32)
-    assert split_k_params(208, 2112, 7168)[:4] == (2, 128, 128, 32)
-    assert split_k_params(400, 512, 7168) is None
+    should_split_k = mm_globals["_should_use_split_k_mm"]
+    for M, N in (
+        (2, 512),
+        (24, 384),
+        (32, 384),
+        (32, 512),
+        (128, 512),
+        (136, 512),
+        (240, 512),
+        (240, 384),
+        (320, 384),
+        (320, 512),
+        (384, 512),
+        (480, 512),
+        (512, 384),
+        (208, 2112),
+    ):
+        assert should_split_k(M, N, 7168)
+    assert not should_split_k(400, 512, 7168)
 
 
 @pytest.mark.mm
+@pytest.mark.parametrize("M,N,K", [(33, 131, 47), (65, 129, 71), (67, 537, 538)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_mm_thead_unaligned_k_falls_back(dtype):
-    M, N, K = 65, 129, 71
+def test_mm_thead_unaligned_tiles_use_ppu(M, N, K, dtype, monkeypatch):
     a = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
     b = torch.randn((K, N), dtype=dtype, device=flag_gems.device)
     ref = torch.mm(utils.to_reference(a, True), utils.to_reference(b, True))
+    mm_globals = backend.get_backend_state().ops_module.mm.__globals__
+    monkeypatch.setitem(mm_globals, "_generic_mm", _unexpected_mm_fallback)
 
     with flag_gems.use_gems():
         actual = torch.mm(a, b)

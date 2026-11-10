@@ -58,6 +58,102 @@ mm_general_tma:
      N: default
      K: default
      dtype: default
+mm_tle_non_ws_pipe:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        NUM_SLOTS: num_slots
+        MMA_GROUP: mma_group
+        GROUP_M: group_m
+      num_stages: stages
+      num_warps: warps
+    block_m:
+      - 64
+      - 128
+    block_n:
+      - 64
+      - 128
+      - 256
+    block_k:
+      - 32
+      - 64
+      - 128
+      - 256
+    num_slots:
+      - 1
+      - 2
+      - 3
+      - 4
+    mma_group:
+      - 1
+      - 2
+      - 3
+      - 4
+    group_m:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+    stages:
+      - 3
+    warps:
+      - 4
+      - 8
+  - strategy:
+      M: mthreads_mm_bucket
+      N: mthreads_mm_bucket
+      K: mthreads_mm_bucket
+mm_tle_ws_pipe:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        NUM_SLOTS: num_slots
+        MMA_GROUP: mma_group
+        GROUP_M: group_m
+      num_stages: stages
+      num_warps: warps
+    block_m:
+      - 128
+      - 256
+    block_n:
+      - 128
+      - 256
+    block_k:
+      - 32
+      - 64
+      - 128
+    num_slots:
+      - 1
+      - 2
+      - 3
+      - 4
+    mma_group:
+      - 1
+      - 2
+      - 3
+      - 4
+    group_m:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+    stages:
+      - 3
+    warps:
+      - 8
+      - 16
+  - strategy:
+      M: mthreads_mm_bucket
+      N: mthreads_mm_bucket
+      K: mthreads_mm_bucket
 mm:
   - config:
     param_map:

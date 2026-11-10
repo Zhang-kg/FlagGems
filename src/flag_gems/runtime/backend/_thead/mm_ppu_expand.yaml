@@ -9,10 +9,9 @@
 # Offline Expanded search space for the PPU row-major GEMM kernel.  The
 # production Pareto list remains in ops/mm.py and is used in Default mode.
 #
-# The Cartesian product contains 3,200 raw candidates.  The PPU-specific
-# config builder removes configurations that exceed the conservative shared
-# memory budget or require more than 128 FP32 accumulator registers per
-# thread, leaving 2,944 legal/performance-credible candidates.
+# The Cartesian product is intentionally bounded.  The PPU-specific config
+# builder removes configurations that exceed the conservative shared-memory
+# budget or require more than 128 FP32 accumulator registers per thread.
 mm_ppu:
   - config:
     param_map:
@@ -25,17 +24,18 @@ mm_ppu:
       num_stages: stages
       num_warps: warps
     block_m:
-      - 16
       - 32
       - 64
       - 128
       - 256
     block_n:
+      - 8
       - 16
       - 32
       - 64
       - 128
       - 256
+      - 512
     block_k:
       - 32
       - 64
@@ -47,6 +47,10 @@ mm_ppu:
     load_mode:
       # Both operands use TLE/AIU asynchronous loads.
       - 0
+      # Only A uses TLE/AIU asynchronous loads.
+      - 1
+      # Only B uses TLE/AIU asynchronous loads.
+      - 2
       # Both operands use regular Triton loads.
       - 3
     stages:
@@ -58,6 +62,7 @@ mm_ppu:
       - 4
       - 8
   - strategy:
+      FUSE_ADDMM: default
       M: default
       N: default
       K: default
@@ -95,6 +100,7 @@ mm_ppu_small_m:
       - 4
       - 8
   - strategy:
+      FUSE_ADDMM: default
       M: default
       N: default
       K: default
@@ -135,6 +141,214 @@ mm_ppu_mid_m:
       - 4
       - 8
   - strategy:
+      FUSE_ADDMM: default
       M: default
       N: default
       K: default
+
+# Batched PPU GEMM uses the same legal physical tile ranges as mm, with batch
+# and fused-bias state included in the tuning key.
+bmm_ppu:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        GROUP_M: group_m
+        LOAD_MODE: load_mode
+      num_stages: stages
+      num_warps: warps
+    block_m:
+      - 32
+      - 64
+      - 128
+      - 256
+    block_n:
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+    block_k:
+      - 32
+      - 64
+    group_m:
+      - 1
+      - 2
+      - 4
+      - 8
+    load_mode:
+      - 0
+      - 1
+      - 2
+      - 3
+    stages:
+      - 2
+      - 3
+      - 4
+      - 5
+    warps:
+      - 4
+      - 8
+  - strategy:
+      FUSE_BIAS: default
+      batch: default
+      M: default
+      N: default
+      K: default
+
+bmm_ppu_small_m:
+  - config:
+    param_map:
+      META:
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        LOAD_MODE: load_mode
+      num_stages: stages
+      num_warps: warps
+    block_n:
+      - 64
+      - 128
+      - 256
+      - 512
+    block_k:
+      - 32
+      - 64
+    load_mode:
+      - 0
+      - 1
+      - 2
+      - 3
+    stages:
+      - 2
+      - 3
+      - 4
+      - 5
+    warps:
+      - 4
+      - 8
+  - strategy:
+      FUSE_BIAS: default
+      batch: default
+      M: default
+      N: default
+      K: default
+
+gemv_ppu:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_K: block_k
+      num_stages: stages
+      num_warps: warps
+    block_m:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+    block_k:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+    stages:
+      - 2
+      - 3
+    warps:
+      - 4
+      - 8
+  - strategy:
+      M: default
+      K: default
+
+# Expanded split-K spaces retain the measured candidates and add nearby legal
+# tiles.  Each generated config list stays below 5,000 after legality
+# filtering; runtime pruning removes shape-incompatible contiguous slices.
+mm_ppu_split_k:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        SPLIT_K: split_k
+        LOAD_MODE: load_mode
+        INTERLEAVED: interleaved
+      num_stages: stages
+      num_warps: warps
+    block_m: [16, 32, 64, 128]
+    block_n: [64, 128, 256]
+    block_k: [32, 64, 128]
+    split_k: [2, 4, 6, 7, 8]
+    load_mode: [0, 2, 3]
+    interleaved: [false, true]
+    stages: [4, 5]
+    warps: [4, 8]
+  - strategy:
+      M: default
+      N: default
+      K: default
+
+bmm_ppu_split_k:
+  - config:
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        SPLIT_K: split_k
+        LOAD_MODE: load_mode
+        INTERLEAVED: interleaved
+      num_stages: stages
+      num_warps: warps
+    block_m: [32, 64, 128]
+    block_n: [64, 128, 256]
+    block_k: [32, 64]
+    split_k: [2, 4, 6, 8]
+    load_mode: [0, 2, 3]
+    interleaved: [false, true]
+    stages: [3, 4]
+    warps: [4, 8]
+  - strategy:
+      batch: default
+      M: default
+      N: default
+      K: default
+
+mm_ppu_split_k_reduce:
+  - config:
+    param_map:
+      META:
+        BLOCK: block
+        VEC: vec
+      num_stages: stages
+      num_warps: warps
+    block: [128, 256]
+    vec: [4, 8]
+    stages: [1]
+    warps: [4, 8]
+  - strategy:
+      n_elements: default
+
+bmm_ppu_split_k_reduce:
+  - config:
+    param_map:
+      META:
+        BLOCK: block
+        VEC: vec
+      num_stages: stages
+      num_warps: warps
+    block: [128, 256]
+    vec: [4, 8]
+    stages: [1]
+    warps: [4, 8]
+  - strategy:
+      M: default
+      N: default
+      total_elements: default
