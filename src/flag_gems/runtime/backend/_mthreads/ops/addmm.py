@@ -333,12 +333,14 @@ def _small_m_bm64_bn64_bk128_s2_producer(
     b_writer,
     a_desc,
     b_desc,
+    pid_m,
     pid_n,
     N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     K_TILES: tl.constexpr,
     TRANS_B: tl.constexpr,
 ):
+    m_offset = (pid_m * _SMALL_M_BM).to(tl.int32)
     n_offset = (pid_n * _SMALL_M_BN).to(tl.int32)
     for k_iter in tl.range(0, K_TILES, num_stages=1):
         k_offset = (k_iter * BLOCK_K).to(tl.int32)
@@ -348,7 +350,7 @@ def _small_m_bm64_bn64_bk128_s2_producer(
             a_desc,
             a_slot.a,
             (_SMALL_M_BM, BLOCK_K),
-            (0, k_offset),
+            (m_offset, k_offset),
         )
         if TRANS_B:
             tle.gpu.copy(
@@ -374,6 +376,7 @@ def _small_m_bm64_bn64_bk128_s2_consumer(
     b_reader,
     bias,
     out,
+    pid_m,
     pid_n,
     alpha,
     beta,
@@ -416,7 +419,7 @@ def _small_m_bm64_bn64_bk128_s2_consumer(
         a_reader.release(k_iter)
         b_reader.release(k_iter)
 
-    rows = tl.arange(0, _SMALL_M_BM)
+    rows = pid_m * _SMALL_M_BM + tl.arange(0, _SMALL_M_BM)
     columns = pid_n * _SMALL_M_BN + tl.arange(0, _SMALL_M_BN)
     mask = (rows[:, None] < M) & (columns[None, :] < N)
     if BIAS_IS_SCALAR:
@@ -468,6 +471,7 @@ def _addmm_bm64_bn64_bk128_s2_small_m_ws_kernel(
     BIAS_IS_SCALAR: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
     b_rows: tl.constexpr = _SMALL_M_BN if TRANS_B else BLOCK_K
     b_columns: tl.constexpr = BLOCK_K if TRANS_B else _SMALL_M_BN
     a_smem = tle.gpu.alloc(
@@ -505,6 +509,7 @@ def _addmm_bm64_bn64_bk128_s2_small_m_ws_kernel(
                     b_pipe.reader(),
                     bias,
                     out,
+                    pid_m,
                     pid_n,
                     alpha,
                     beta,
@@ -528,6 +533,7 @@ def _addmm_bm64_bn64_bk128_s2_small_m_ws_kernel(
                     b_pipe.writer(),
                     a_desc,
                     b_desc,
+                    pid_m,
                     pid_n,
                     N,
                     BLOCK_K,
@@ -563,7 +569,9 @@ def _launch_addmm_bm64_bn64_bk128_s2_small_m_ws(
     else:
         b_desc = TensorDescriptor.from_tensor(mat2, [128, 64])
     with torch_device_fn.device(mat1.device):
-        _addmm_bm64_bn64_bk128_s2_small_m_ws_kernel[(triton.cdiv(n, 64),)](
+        _addmm_bm64_bn64_bk128_s2_small_m_ws_kernel[
+            (triton.cdiv(n, 64), triton.cdiv(m, 64))
+        ](
             a_desc,
             b_desc,
             bias,
