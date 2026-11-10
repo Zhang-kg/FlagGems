@@ -311,6 +311,274 @@ def _nt_gemv_config(bias, mat1, mat2, out):
     return config
 
 
+_SMALL_M_BM = tl.constexpr(64)
+_SMALL_M_BN = tl.constexpr(64)
+_SMALL_M_K_FRAGMENT = tl.constexpr(64)
+
+
+@triton.jit
+def _small_m_bm64_bn64_bk128_s2_producer(
+    a_writer,
+    b_writer,
+    a_desc,
+    b_desc,
+    pid_n,
+    N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_TILES: tl.constexpr,
+    TRANS_B: tl.constexpr,
+):
+    n_offset = (pid_n * _SMALL_M_BN).to(tl.int32)
+    for k_iter in tl.range(0, K_TILES, num_stages=1):
+        k_offset = (k_iter * BLOCK_K).to(tl.int32)
+        a_slot = a_writer.acquire(k_iter)
+        b_slot = b_writer.acquire(k_iter)
+        tle.gpu.copy(
+            a_desc,
+            a_slot.a,
+            (_SMALL_M_BM, BLOCK_K),
+            (0, k_offset),
+        )
+        if TRANS_B:
+            tle.gpu.copy(
+                b_desc,
+                b_slot.b,
+                (_SMALL_M_BN, BLOCK_K),
+                (n_offset, k_offset),
+            )
+        else:
+            tle.gpu.copy(
+                b_desc,
+                b_slot.b,
+                (BLOCK_K, _SMALL_M_BN),
+                (k_offset, n_offset),
+            )
+        a_writer.commit(k_iter)
+        b_writer.commit(k_iter)
+
+
+@triton.jit
+def _small_m_bm64_bn64_bk128_s2_consumer(
+    a_reader,
+    b_reader,
+    bias,
+    out,
+    pid_n,
+    alpha,
+    beta,
+    stride_bias_m,
+    stride_bias_n,
+    stride_out_m,
+    stride_out_n,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K_TILES: tl.constexpr,
+    K_PARTS: tl.constexpr,
+    TRANS_B: tl.constexpr,
+    BIAS_IS_VECTOR: tl.constexpr,
+    BIAS_IS_SCALAR: tl.constexpr,
+):
+    accumulator = tl.zeros((_SMALL_M_BM, _SMALL_M_BN), dtype=tl.float32)
+    for k_iter in tl.range(0, K_TILES, num_stages=1):
+        a_ready = a_reader.wait(k_iter)
+        b_ready = b_reader.wait(k_iter)
+        for k_part in tl.static_range(K_PARTS):
+            a_k = a_ready.slot.a.subslice(
+                k_part * _SMALL_M_K_FRAGMENT,
+                _SMALL_M_K_FRAGMENT,
+                dim=1,
+            )
+            if TRANS_B:
+                b_k = b_ready.slot.b.subslice(
+                    k_part * _SMALL_M_K_FRAGMENT,
+                    _SMALL_M_K_FRAGMENT,
+                    dim=1,
+                )
+            else:
+                b_k = b_ready.slot.b.subslice(
+                    k_part * _SMALL_M_K_FRAGMENT,
+                    _SMALL_M_K_FRAGMENT,
+                    dim=0,
+                )
+            accumulator = tle.gpu.wgmma(a_k, b_k, accumulator, trans_b=TRANS_B)
+            accumulator = tle.gpu.wgmma_wait(0, accumulator)
+        a_reader.release(k_iter)
+        b_reader.release(k_iter)
+
+    rows = tl.arange(0, _SMALL_M_BM)
+    columns = pid_n * _SMALL_M_BN + tl.arange(0, _SMALL_M_BN)
+    mask = (rows[:, None] < M) & (columns[None, :] < N)
+    if BIAS_IS_SCALAR:
+        bias_tile = tl.load(bias).to(tl.float32)
+    elif BIAS_IS_VECTOR:
+        bias_tile = tl.load(
+            bias + columns * stride_bias_n,
+            mask=columns < N,
+            other=0.0,
+        ).to(tl.float32)[None, :]
+    else:
+        bias_tile = tl.load(
+            bias
+            + rows[:, None] * stride_bias_m
+            + columns[None, :] * stride_bias_n,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    output = accumulator * alpha + bias_tile * beta
+    tl.store(
+        out
+        + rows[:, None] * stride_out_m
+        + columns[None, :] * stride_out_n,
+        output.to(out.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@libentry()
+@triton.jit(do_not_specialize=["alpha", "beta"])
+def _addmm_bm64_bn64_bk128_s2_small_m_ws_kernel(
+    a_desc,
+    b_desc,
+    bias,
+    out,
+    alpha,
+    beta,
+    stride_bias_m,
+    stride_bias_n,
+    stride_out_m,
+    stride_out_n,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
+    TRANS_B: tl.constexpr,
+    BIAS_IS_VECTOR: tl.constexpr,
+    BIAS_IS_SCALAR: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    b_rows: tl.constexpr = _SMALL_M_BN if TRANS_B else BLOCK_K
+    b_columns: tl.constexpr = BLOCK_K if TRANS_B else _SMALL_M_BN
+    a_smem = tle.gpu.alloc(
+        (NUM_SLOTS, _SMALL_M_BM, BLOCK_K),
+        dtype=a_desc.dtype,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=True,
+    )
+    b_smem = tle.gpu.alloc(
+        (NUM_SLOTS, b_rows, b_columns),
+        dtype=b_desc.dtype,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=True,
+    )
+    a_pipe = tle.pipe(
+        capacity=NUM_SLOTS,
+        scope="cta",
+        name="addmm_small_m_bm64_bn64_bk128_s2_a",
+        a=a_smem,
+    )
+    b_pipe = tle.pipe(
+        capacity=NUM_SLOTS,
+        scope="cta",
+        name="addmm_small_m_bm64_bn64_bk128_s2_b",
+        b=b_smem,
+    )
+    k_tiles: tl.constexpr = K // BLOCK_K
+    k_parts: tl.constexpr = BLOCK_K // _SMALL_M_K_FRAGMENT
+    tle.gpu.warp_specialize(
+        [
+            (
+                _small_m_bm64_bn64_bk128_s2_consumer,
+                (
+                    a_pipe.reader(),
+                    b_pipe.reader(),
+                    bias,
+                    out,
+                    pid_n,
+                    alpha,
+                    beta,
+                    stride_bias_m,
+                    stride_bias_n,
+                    stride_out_m,
+                    stride_out_n,
+                    M,
+                    N,
+                    k_tiles,
+                    k_parts,
+                    TRANS_B,
+                    BIAS_IS_VECTOR,
+                    BIAS_IS_SCALAR,
+                ),
+            ),
+            (
+                _small_m_bm64_bn64_bk128_s2_producer,
+                (
+                    a_pipe.writer(),
+                    b_pipe.writer(),
+                    a_desc,
+                    b_desc,
+                    pid_n,
+                    N,
+                    BLOCK_K,
+                    k_tiles,
+                    TRANS_B,
+                ),
+            ),
+        ],
+        worker_num_warps=[4],
+        worker_num_regs=[24],
+    )
+
+
+def _launch_addmm_bm64_bn64_bk128_s2_small_m_ws(
+    bias,
+    mat1,
+    mat2,
+    out,
+    alpha,
+    beta,
+):
+    m, k = mat1.shape
+    n = mat2.shape[1]
+    if out is None:
+        out = torch.empty((m, n), dtype=mat1.dtype, device=mat1.device)
+    bias, stride_bias_m, stride_bias_n, bias_is_vector, bias_is_scalar = (
+        _prepare_bias(bias, out)
+    )
+    trans_b = mat2.stride(0) == 1 and mat2.stride(1) == k
+    a_desc = TensorDescriptor.from_tensor(mat1, [64, 128])
+    if trans_b:
+        b_desc = TensorDescriptor(mat2, [n, k], [k, 1], [64, 128])
+    else:
+        b_desc = TensorDescriptor.from_tensor(mat2, [128, 64])
+    with torch_device_fn.device(mat1.device):
+        _addmm_bm64_bn64_bk128_s2_small_m_ws_kernel[(triton.cdiv(n, 64),)](
+            a_desc,
+            b_desc,
+            bias,
+            out,
+            alpha,
+            beta,
+            stride_bias_m,
+            stride_bias_n,
+            out.stride(0),
+            out.stride(1),
+            M=m,
+            N=n,
+            K=k,
+            BLOCK_K=128,
+            NUM_SLOTS=2,
+            TRANS_B=trans_b,
+            BIAS_IS_VECTOR=bias_is_vector,
+            BIAS_IS_SCALAR=bias_is_scalar,
+            num_warps=8,
+            num_stages=2,
+            enable_backend_opt=True,
+            disable_max_ilp_scheduler=True,
+        )
+    return out
+
+
 @libentry()
 @libtuner(
     configs=[
