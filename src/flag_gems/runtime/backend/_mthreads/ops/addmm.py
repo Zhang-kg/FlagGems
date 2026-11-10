@@ -93,6 +93,16 @@ _NT_GEMV_CONFIGS = {
     (1, 4, 16384): (1, 4096, 8),
 }
 
+# For these very wide NT matrices, materializing the logical KxN view costs
+# much more than consuming the physical [N, K] allocation directly.  Keep the
+# bypass shape-exact: for smaller outputs the existing SQMMA paths can amortize
+# their copy and are substantially faster than the generic strided kernel.
+_NT_FMA_NO_COPY_SHAPES = {
+    (100, 16160, 7168),
+    (100, 20480, 7168),
+    (100, 248320, 2048),
+}
+
 
 EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "addmm_mthreads_expand.yaml")
@@ -2571,7 +2581,11 @@ def _addmm_impl(bias, mat1, mat2, out, beta, alpha):
     # the wide-N validation shapes (the copy can be much larger than the GEMM).
     # The generic kernel already consumes this K-contiguous layout directly and
     # only copies it when a large M provides enough reuse to amortize the copy.
-    if mat2.stride(0) == 1 and mat2.stride(1) > 1:
+    if (
+        (M, N, K) in _NT_FMA_NO_COPY_SHAPES
+        and mat2.stride(0) == 1
+        and mat2.stride(1) == K
+    ):
         return addmm_fma(bias, mat1, mat2, alpha=alpha, beta=beta, out=out)
 
     tle_result = try_addmm_tle(bias, mat1, mat2, out, beta, alpha)
