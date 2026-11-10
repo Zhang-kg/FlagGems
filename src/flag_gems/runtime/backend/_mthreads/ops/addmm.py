@@ -2371,6 +2371,15 @@ def _addmm_impl(bias, mat1, mat2, out, beta, alpha):
     if _matches_core_half_dot_contract(bias, mat1, mat2, out, beta, alpha):
         return _launch_core_half_dot(bias, mat1, mat2, out)
 
+    # A logical KxN tensor obtained from an NxK contiguous allocation has
+    # stride (1, K).  TensorDescriptor-based SQMMA paths currently materialize
+    # that tensor as row-major before launching, which becomes catastrophic for
+    # the wide-N validation shapes (the copy can be much larger than the GEMM).
+    # The generic kernel already consumes this K-contiguous layout directly and
+    # only copies it when a large M provides enough reuse to amortize the copy.
+    if mat2.stride(0) == 1 and mat2.stride(1) > 1:
+        return addmm_fma(bias, mat1, mat2, alpha=alpha, beta=beta, out=out)
+
     tle_result = try_addmm_tle(bias, mat1, mat2, out, beta, alpha)
     if tle_result is not None:
         return tle_result
